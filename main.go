@@ -15,8 +15,8 @@ import (
 )
 
 var upgrader = websocket.Upgrader{
-	ReadBufferSize:  8192,
-	WriteBufferSize: 8192,
+	ReadBufferSize:  65536, // 64 KB buffers for heavy data frames
+	WriteBufferSize: 65536,
 	CheckOrigin: func(r *http.Request) bool {
 		return true // Allow CORS
 	},
@@ -29,34 +29,47 @@ type Client struct {
 }
 
 type Hub struct {
-	clients       map[*Client]bool
-	broadcast     chan []byte
-	register      chan *Client
-	unregister    chan *Client
-	mu            sync.RWMutex
-	totalReceived uint64
-	totalSent     uint64
-	msgPerSec     uint64
-	lastSecCount  uint64
+	clients        map[*Client]bool
+	broadcast      chan []byte
+	register       chan *Client
+	unregister     chan *Client
+	mu             sync.RWMutex
+	totalReceived  uint64
+	totalBytesRecv uint64
+	totalSent      uint64
+	totalBytesSent uint64
+	msgPerSec      uint64
+	bytesPerSec    uint64
+	lastSecCount   uint64
+	lastSecBytes   uint64
 }
 
 func NewHub() *Hub {
 	h := &Hub{
 		clients:    make(map[*Client]bool),
-		broadcast:  make(chan []byte, 20000), // Large capacity buffer for high-frequency broadcasting
+		broadcast:  make(chan []byte, 50000), // Large buffer for heavy packet queues
 		register:   make(chan *Client, 256),
 		unregister: make(chan *Client, 256),
 	}
 
-	// Speed calculation ticker
+	// High-speed telemetry calculation ticker
 	go func() {
 		ticker := time.NewTicker(1 * time.Second)
 		for range ticker.C {
-			current := atomic.LoadUint64(&h.totalReceived)
-			last := h.lastSecCount
-			h.lastSecCount = current
-			if current >= last {
-				atomic.StoreUint64(&h.msgPerSec, current-last)
+			currMsgs := atomic.LoadUint64(&h.totalReceived)
+			currBytes := atomic.LoadUint64(&h.totalBytesRecv)
+
+			lastMsgs := h.lastSecCount
+			lastBytes := h.lastSecBytes
+
+			h.lastSecCount = currMsgs
+			h.lastSecBytes = currBytes
+
+			if currMsgs >= lastMsgs {
+				atomic.StoreUint64(&h.msgPerSec, currMsgs-lastMsgs)
+			}
+			if currBytes >= lastBytes {
+				atomic.StoreUint64(&h.bytesPerSec, currBytes-lastBytes)
 			}
 		}
 	}()
@@ -73,12 +86,11 @@ func (h *Hub) Run() {
 			total := len(h.clients)
 			h.mu.Unlock()
 
-			// Broadcast client join event to all peers
 			sysMsg, _ := json.Marshal(map[string]interface{}{
 				"type":      "system",
 				"event":     "joined",
 				"clientId":  client.ID,
-				"message":   fmt.Sprintf("Client %s connected", client.ID),
+				"message":   fmt.Sprintf("Client %s connected (Ready for Heavy Traffic)", client.ID),
 				"online":    total,
 				"timestamp": time.Now().Format("15:04:05.000"),
 			})
@@ -92,7 +104,6 @@ func (h *Hub) Run() {
 				total := len(h.clients)
 				h.mu.Unlock()
 
-				// Broadcast client leave event
 				sysMsg, _ := json.Marshal(map[string]interface{}{
 					"type":      "system",
 					"event":     "left",
@@ -107,13 +118,15 @@ func (h *Hub) Run() {
 			}
 
 		case message := <-h.broadcast:
+			msgLen := uint64(len(message))
 			h.mu.RLock()
 			for client := range h.clients {
 				select {
 				case client.Send <- message:
 					atomic.AddUint64(&h.totalSent, 1)
+					atomic.AddUint64(&h.totalBytesSent, msgLen)
 				default:
-					// Don't block hub if one slow consumer lags
+					// Drop if consumer queue is overflowing to prevent blocking the entire engine
 				}
 			}
 			h.mu.RUnlock()
@@ -140,18 +153,24 @@ func (c *Client) readPump(h *Hub) {
 		c.Conn.Close()
 	}()
 
+	// Support up to 10 MB payload per packet
+	c.Conn.SetReadLimit(10 * 1024 * 1024)
+
 	for {
 		_, raw, err := c.Conn.ReadMessage()
 		if err != nil {
 			break
 		}
+		rawLen := uint64(len(raw))
 		atomic.AddUint64(&h.totalReceived, 1)
+		atomic.AddUint64(&h.totalBytesRecv, rawLen)
 
-		// Format message with sender metadata & timestamp
+		// Broadcast received message to peers
 		formatted, _ := json.Marshal(map[string]interface{}{
 			"type":      "message",
 			"sender":    c.ID,
 			"payload":   string(raw),
+			"size":      rawLen,
 			"timestamp": time.Now().Format("15:04:05.000"),
 		})
 
@@ -194,16 +213,15 @@ func main() {
 		client := &Client{
 			ID:   clientID,
 			Conn: conn,
-			Send: make(chan []byte, 2048),
+			Send: make(chan []byte, 4096),
 		}
 
 		hub.register <- client
 
-		// Welcome handshake
 		welcomeMsg, _ := json.Marshal(map[string]interface{}{
 			"type":      "welcome",
 			"clientId":  clientID,
-			"message":   "Connected to Real-time WebSocket Hub",
+			"message":   "Connected to Extreme WebSocket Stress Server",
 			"timestamp": time.Now().Format("15:04:05.000"),
 		})
 		client.Send <- welcomeMsg
@@ -220,42 +238,49 @@ func main() {
 		var mem runtime.MemStats
 		runtime.ReadMemStats(&mem)
 
+		bytesRecv := atomic.LoadUint64(&hub.totalBytesRecv)
+		bytesPerSec := atomic.LoadUint64(&hub.bytesPerSec)
+
 		json.NewEncoder(w).Encode(map[string]interface{}{
-			"status":           "OK",
-			"activeClients":    hub.ClientCount(),
-			"totalReceived":    atomic.LoadUint64(&hub.totalReceived),
-			"totalSent":        atomic.LoadUint64(&hub.totalSent),
-			"messagesPerSec":   atomic.LoadUint64(&hub.msgPerSec),
-			"uptime":           time.Since(startTime).Round(time.Second).String(),
-			"goroutines":       runtime.NumGoroutine(),
-			"memoryAllocMB":    fmt.Sprintf("%.2f MB", float64(mem.Alloc)/1024/1024),
-			"timestamp":        time.Now(),
+			"status":            "OK",
+			"activeClients":     hub.ClientCount(),
+			"totalReceived":     atomic.LoadUint64(&hub.totalReceived),
+			"totalBytesRecv":    bytesRecv,
+			"totalMBRecv":       fmt.Sprintf("%.2f MB", float64(bytesRecv)/(1024*1024)),
+			"throughputMBs":     fmt.Sprintf("%.2f MB/s", float64(bytesPerSec)/(1024*1024)),
+			"messagesPerSec":    atomic.LoadUint64(&hub.msgPerSec),
+			"uptime":            time.Since(startTime).Round(time.Second).String(),
+			"goroutines":        runtime.NumGoroutine(),
+			"memoryAllocMB":     fmt.Sprintf("%.2f MB", float64(mem.Alloc)/(1024*1024)),
+			"systemSysMemMB":    fmt.Sprintf("%.2f MB", float64(mem.Sys)/(1024*1024)),
+			"gcCycles":          mem.NumGC,
+			"timestamp":         time.Now(),
 		})
 	})
 
-	// Web UI Dashboard with Real-time Live Rendering: /
+	// Web UI Dashboard: /
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/" {
 			http.NotFound(w, r)
 			return
 		}
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-		w.Write([]byte(htmlDashboard))
+		w.Write([]byte(htmlHeavyStressDashboard))
 	})
 
 	addr := ":" + port
-	fmt.Printf("====================================================\n")
-	fmt.Printf("⚡ Real-time WebSocket Live Render Server Online!\n")
-	fmt.Printf("🌐 Live Stream Dashboard : http://localhost:%s\n", port)
-	fmt.Printf("📡 WebSocket Endpoint     : ws://localhost:%s/ws\n", port)
-	fmt.Printf("📊 Live Telemetry API     : http://localhost:%s/api/stats\n", port)
-	fmt.Printf("====================================================\n")
+	fmt.Printf("==============================================================\n")
+	fmt.Printf("🔥 Extreme Load & Heavy Payload WebSocket Server Online!\n")
+	fmt.Printf("🌐 Stress Testing Dashboard : http://localhost:%s\n", port)
+	fmt.Printf("📡 WebSocket Stream Endpoint : ws://localhost:%s/ws\n", port)
+	fmt.Printf("📊 Live Telemetry API        : http://localhost:%s/api/stats\n", port)
+	fmt.Printf("==============================================================\n")
 
 	server := &http.Server{
 		Addr:         addr,
 		Handler:      mux,
-		ReadTimeout:  15 * time.Second,
-		WriteTimeout: 15 * time.Second,
+		ReadTimeout:  30 * time.Second,
+		WriteTimeout: 30 * time.Second,
 	}
 
 	if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
@@ -263,27 +288,27 @@ func main() {
 	}
 }
 
-const htmlDashboard = `<!DOCTYPE html>
+const htmlHeavyStressDashboard = `<!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>📡 Live Real-Time WebSocket Message Stream</title>
+    <title>🔥 Extreme Heavy-Payload WebSocket Server Stress Tester</title>
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-    <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@400;600;700;900&family=JetBrains+Mono:wght@400;600;800&display=swap" rel="stylesheet">
+    <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@400;600;700;900&family=JetBrains+Mono:wght@400;700;900&display=swap" rel="stylesheet">
     <style>
         :root {
-            --bg-dark: #07080d;
-            --card-bg: rgba(14, 17, 27, 0.85);
+            --bg-dark: #06070c;
+            --card-bg: rgba(14, 17, 28, 0.88);
             --neon-cyan: #00ffcc;
             --neon-pink: #ff0055;
             --neon-yellow: #ffe600;
             --neon-blue: #00b4d8;
-            --neon-green: #10b981;
-            --border-color: rgba(0, 255, 204, 0.2);
-            --text-main: #f3f6fa;
-            --text-muted: #8896ab;
+            --neon-orange: #ff6b00;
+            --border-color: rgba(255, 0, 85, 0.25);
+            --text-main: #f1f5f9;
+            --text-muted: #8e9bb0;
         }
 
         * { margin: 0; padding: 0; box-sizing: border-box; }
@@ -291,15 +316,15 @@ const htmlDashboard = `<!DOCTYPE html>
             font-family: 'Outfit', sans-serif;
             background: var(--bg-dark);
             background-image: 
-                radial-gradient(circle at 15% 15%, rgba(0, 255, 204, 0.08) 0%, transparent 40%),
-                radial-gradient(circle at 85% 85%, rgba(255, 0, 85, 0.08) 0%, transparent 40%);
+                radial-gradient(circle at 10% 10%, rgba(255, 0, 85, 0.12) 0%, transparent 40%),
+                radial-gradient(circle at 90% 90%, rgba(0, 255, 204, 0.1) 0%, transparent 40%);
             color: var(--text-main);
             min-height: 100vh;
             padding: 20px;
         }
 
         .container {
-            max-width: 1200px;
+            max-width: 1240px;
             margin: 0 auto;
         }
 
@@ -313,13 +338,13 @@ const htmlDashboard = `<!DOCTYPE html>
             padding: 16px 24px;
             border-radius: 16px;
             margin-bottom: 20px;
-            box-shadow: 0 10px 30px rgba(0, 0, 0, 0.5);
+            box-shadow: 0 10px 30px rgba(0, 0, 0, 0.6), 0 0 20px rgba(255, 0, 85, 0.1);
         }
 
         .header-title h1 {
             font-size: 22px;
             font-weight: 900;
-            background: linear-gradient(135deg, var(--neon-cyan), var(--neon-blue));
+            background: linear-gradient(135deg, var(--neon-pink), var(--neon-orange), var(--neon-yellow));
             -webkit-background-clip: text;
             -webkit-text-fill-color: transparent;
         }
@@ -329,111 +354,128 @@ const htmlDashboard = `<!DOCTYPE html>
             color: var(--text-muted);
         }
 
-        .peer-badge {
+        .status-pill {
             display: flex;
             align-items: center;
-            gap: 12px;
+            gap: 10px;
             background: rgba(0, 0, 0, 0.5);
             padding: 8px 18px;
             border-radius: 30px;
             font-size: 13px;
             border: 1px solid rgba(255, 255, 255, 0.1);
+            font-weight: 700;
         }
 
-        .dot {
-            width: 10px;
-            height: 10px;
+        .pulse-dot {
+            width: 12px;
+            height: 12px;
             border-radius: 50%;
             background: var(--neon-cyan);
             box-shadow: 0 0 10px var(--neon-cyan);
-            animation: pulse-green 2s infinite;
         }
 
-        @keyframes pulse-green {
-            0%, 100% { transform: scale(1); opacity: 1; }
-            50% { transform: scale(1.3); opacity: 0.6; }
+        .pulse-dot.stressing {
+            background: var(--neon-pink);
+            box-shadow: 0 0 18px var(--neon-pink);
+            animation: hyper-pulse 0.3s infinite alternate;
         }
 
-        /* Top Metrics */
-        .stats-bar {
+        @keyframes hyper-pulse {
+            from { transform: scale(0.9); opacity: 0.5; }
+            to { transform: scale(1.4); opacity: 1; }
+        }
+
+        /* Metrics Bar */
+        .metrics-grid {
             display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
             gap: 14px;
             margin-bottom: 20px;
         }
 
-        .stat-item {
+        .metric-card {
             background: var(--card-bg);
             border: 1px solid var(--border-color);
-            border-radius: 12px;
-            padding: 16px 20px;
+            border-radius: 14px;
+            padding: 18px 20px;
             display: flex;
             flex-direction: column;
             gap: 4px;
+            position: relative;
+            overflow: hidden;
         }
 
-        .stat-label {
+        .metric-card::before {
+            content: '';
+            position: absolute;
+            top: 0; left: 0; right: 0; height: 3px;
+            background: linear-gradient(90deg, var(--neon-pink), var(--neon-orange));
+        }
+
+        .metric-card.cyan::before { background: linear-gradient(90deg, var(--neon-cyan), transparent); }
+        .metric-card.yellow::before { background: linear-gradient(90deg, var(--neon-yellow), transparent); }
+
+        .metric-label {
             font-size: 12px;
             font-weight: 700;
             color: var(--text-muted);
             text-transform: uppercase;
+            letter-spacing: 0.5px;
         }
 
-        .stat-val {
+        .metric-val {
             font-family: 'JetBrains Mono', monospace;
-            font-size: 24px;
+            font-size: 26px;
             font-weight: 900;
-            color: var(--neon-cyan);
+            color: var(--neon-pink);
         }
 
-        .stat-val.yellow { color: var(--neon-yellow); }
-        .stat-val.pink { color: var(--neon-pink); }
-        .stat-val.green { color: var(--neon-green); }
+        .metric-card.cyan .metric-val { color: var(--neon-cyan); }
+        .metric-card.yellow .metric-val { color: var(--neon-yellow); }
 
-        /* Main Workspace */
-        .workspace-grid {
+        /* Workspace */
+        .workspace {
             display: grid;
-            grid-template-columns: 360px 1fr;
+            grid-template-columns: 420px 1fr;
             gap: 20px;
         }
 
-        @media (max-width: 900px) {
-            .workspace-grid { grid-template-columns: 1fr; }
+        @media (max-width: 980px) {
+            .workspace { grid-template-columns: 1fr; }
         }
 
-        .card {
+        .panel {
             background: var(--card-bg);
             border: 1px solid var(--border-color);
             border-radius: 16px;
-            padding: 20px;
+            padding: 22px;
             display: flex;
             flex-direction: column;
         }
 
-        .card-header {
+        .panel-header {
             display: flex;
             justify-content: space-between;
             align-items: center;
-            margin-bottom: 16px;
+            margin-bottom: 18px;
             border-bottom: 1px solid rgba(255, 255, 255, 0.08);
-            padding-bottom: 10px;
+            padding-bottom: 12px;
         }
 
-        .card-header h2 {
-            font-size: 17px;
+        .panel-header h2 {
+            font-size: 18px;
             font-weight: 800;
-            color: var(--neon-cyan);
+            color: var(--neon-pink);
             display: flex;
             align-items: center;
             gap: 8px;
         }
 
-        /* Controls Panel */
-        .form-group {
+        .form-row {
             margin-bottom: 16px;
         }
 
-        .form-group label {
+        .form-row label {
             display: flex;
             justify-content: space-between;
             font-size: 13px;
@@ -441,77 +483,119 @@ const htmlDashboard = `<!DOCTYPE html>
             margin-bottom: 6px;
         }
 
-        .form-group label span {
+        .form-row label span {
             color: var(--neon-yellow);
             font-family: 'JetBrains Mono', monospace;
         }
 
         input[type="range"] {
             width: 100%;
-            accent-color: var(--neon-cyan);
+            accent-color: var(--neon-pink);
             cursor: pointer;
         }
 
-        textarea, input[type="text"] {
+        select {
             width: 100%;
-            background: rgba(0, 0, 0, 0.4);
+            background: rgba(0, 0, 0, 0.5);
             border: 1px solid rgba(255, 255, 255, 0.15);
             padding: 10px 14px;
             border-radius: 8px;
             color: #fff;
-            font-family: 'JetBrains Mono', monospace;
+            font-family: 'Outfit', sans-serif;
             font-size: 13px;
             outline: none;
         }
 
-        textarea {
-            resize: none;
-            height: 70px;
+        select:focus {
+            border-color: var(--neon-pink);
         }
 
-        textarea:focus, input[type="text"]:focus {
-            border-color: var(--neon-cyan);
-        }
-
-        .btn {
-            padding: 12px 18px;
-            border-radius: 10px;
-            font-size: 14px;
-            font-weight: 800;
+        .btn-flood {
+            width: 100%;
+            padding: 16px;
+            border-radius: 12px;
+            font-size: 16px;
+            font-weight: 900;
+            letter-spacing: 0.5px;
             border: none;
             cursor: pointer;
             transition: all 0.2s;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            gap: 8px;
-        }
-
-        .btn-primary {
-            background: linear-gradient(135deg, var(--neon-cyan), var(--neon-blue));
-            color: #050608;
-            width: 100%;
-        }
-
-        .btn-primary:hover {
-            transform: translateY(-2px);
-            box-shadow: 0 4px 20px rgba(0, 255, 204, 0.4);
-        }
-
-        .btn-stress {
-            background: linear-gradient(135deg, #ff0055, #ff5500);
-            color: #fff;
-            width: 100%;
             margin-top: 10px;
+            box-shadow: 0 4px 20px rgba(0, 0, 0, 0.5);
         }
 
-        .btn-stress.running {
-            animation: pulse-danger 1s infinite alternate;
+        .btn-start {
+            background: linear-gradient(135deg, #ff0055, #ff6b00);
+            color: #fff;
+        }
+
+        .btn-start:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 8px 30px rgba(255, 0, 85, 0.5);
+        }
+
+        .btn-stop {
+            background: linear-gradient(135deg, #ff0055, #99002b);
+            color: #ffffff;
+            animation: pulse-danger 0.5s infinite alternate;
         }
 
         @keyframes pulse-danger {
-            from { box-shadow: 0 0 10px rgba(255, 0, 85, 0.5); }
-            to { box-shadow: 0 0 25px rgba(255, 0, 85, 0.9); }
+            from { box-shadow: 0 0 10px rgba(255, 0, 85, 0.6); }
+            to { box-shadow: 0 0 30px rgba(255, 0, 85, 1); }
+        }
+
+        /* Live Stream / Packet Inspector */
+        .stream-panel {
+            display: flex;
+            flex-direction: column;
+            height: 620px;
+        }
+
+        .feed-box {
+            flex: 1;
+            background: #040508;
+            border: 1px solid rgba(255, 255, 255, 0.08);
+            border-radius: 12px;
+            padding: 14px;
+            overflow-y: auto;
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 12px;
+            line-height: 1.6;
+            display: flex;
+            flex-direction: column;
+            gap: 6px;
+        }
+
+        .packet-row {
+            padding: 8px 12px;
+            background: rgba(255, 255, 255, 0.02);
+            border-radius: 6px;
+            border-left: 4px solid var(--neon-pink);
+            display: flex;
+            flex-direction: column;
+            gap: 4px;
+            word-break: break-all;
+        }
+
+        .packet-header {
+            display: flex;
+            justify-content: space-between;
+            font-size: 11px;
+        }
+
+        .packet-size {
+            color: var(--neon-yellow);
+            font-weight: 800;
+        }
+
+        .packet-preview {
+            color: #cbd5e1;
+            font-size: 12px;
+            max-height: 40px;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
         }
 
         .btn-clear {
@@ -520,102 +604,11 @@ const htmlDashboard = `<!DOCTYPE html>
             padding: 6px 12px;
             font-size: 12px;
             border-radius: 6px;
+            border: none;
+            cursor: pointer;
         }
 
-        .btn-clear:hover {
-            background: rgba(255, 255, 255, 0.15);
-            color: #fff;
-        }
-
-        /* Live Stream Terminal Box */
-        .stream-card {
-            display: flex;
-            flex-direction: column;
-            height: 600px;
-        }
-
-        .stream-tools {
-            display: flex;
-            align-items: center;
-            gap: 10px;
-        }
-
-        .stream-box {
-            flex: 1;
-            background: #05060a;
-            border: 1px solid rgba(255, 255, 255, 0.08);
-            border-radius: 12px;
-            padding: 16px;
-            overflow-y: auto;
-            font-family: 'JetBrains Mono', monospace;
-            font-size: 13px;
-            line-height: 1.6;
-            display: flex;
-            flex-direction: column;
-            gap: 6px;
-        }
-
-        .msg-row {
-            display: flex;
-            align-items: flex-start;
-            gap: 10px;
-            padding: 6px 10px;
-            background: rgba(255, 255, 255, 0.02);
-            border-radius: 6px;
-            border-left: 3px solid var(--neon-cyan);
-            animation: fadeIn 0.2s ease;
-            word-break: break-all;
-        }
-
-        @keyframes fadeIn {
-            from { opacity: 0; transform: translateX(-5px); }
-            to { opacity: 1; transform: translateX(0); }
-        }
-
-        .msg-row.self {
-            border-left-color: var(--neon-yellow);
-            background: rgba(255, 230, 0, 0.04);
-        }
-
-        .msg-row.system {
-            border-left-color: var(--neon-blue);
-            background: rgba(0, 180, 216, 0.04);
-        }
-
-        .msg-row.stress {
-            border-left-color: var(--neon-pink);
-            background: rgba(255, 0, 85, 0.04);
-        }
-
-        .msg-time {
-            color: var(--text-muted);
-            font-size: 11px;
-            min-width: 85px;
-        }
-
-        .msg-sender {
-            color: var(--neon-cyan);
-            font-weight: 700;
-            min-width: 90px;
-        }
-
-        .msg-row.self .msg-sender { color: var(--neon-yellow); }
-        .msg-row.system .msg-sender { color: var(--neon-blue); }
-        .msg-row.stress .msg-sender { color: var(--neon-pink); }
-
-        .msg-content {
-            color: #e2e8f0;
-            flex: 1;
-        }
-
-        .badge-tag {
-            font-size: 10px;
-            padding: 2px 6px;
-            border-radius: 4px;
-            background: rgba(0, 255, 204, 0.15);
-            color: var(--neon-cyan);
-            margin-right: 6px;
-        }
+        .btn-clear:hover { background: rgba(255, 255, 255, 0.15); color: #fff; }
     </style>
 </head>
 <body>
@@ -623,95 +616,105 @@ const htmlDashboard = `<!DOCTYPE html>
         <!-- Header -->
         <header>
             <div class="header-title">
-                <h1>📡 LIVE REAL-TIME WEBSOCKET STREAM</h1>
-                <span>Direct Multi-Peer Real-Time Data Broadcaster</span>
+                <h1>🔥 EXTREME HEAVY-PAYLOAD WEBSOCKET STRESS TESTER</h1>
+                <span>Massive Multi-Kilobyte Real-Time Millisecond Pressure Generator</span>
             </div>
-            <div class="peer-badge">
-                <span class="dot" id="statusDot"></span>
-                <span id="myPeerId">Connecting...</span>
+            <div class="status-pill">
+                <span class="pulse-dot" id="statusDot"></span>
+                <span id="statusLabel">IDLE / READY</span>
                 <span>|</span>
-                <span>👥 Online: <strong id="valOnline" style="color:var(--neon-cyan)">1</strong></span>
+                <span>⚡ RAM: <strong id="valServerMem" style="color:var(--neon-cyan)">-- MB</strong></span>
             </div>
         </header>
 
-        <!-- Stats Bar -->
-        <div class="stats-bar">
-            <div class="stat-item">
-                <span class="stat-label">Live Incoming Messages</span>
-                <span class="stat-val" id="valReceivedCount">0</span>
+        <!-- Metrics Grid -->
+        <div class="metrics-grid">
+            <div class="metric-card">
+                <span class="metric-label">Bandwidth Throughput</span>
+                <span class="metric-val" id="valThroughput">0.00 MB/s</span>
             </div>
-            <div class="stat-item">
-                <span class="stat-label">Messages / Sec (Rate)</span>
-                <span class="stat-val yellow" id="valLiveSpeed">0 msg/s</span>
+            <div class="metric-card yellow">
+                <span class="metric-label">Live Packet Rate</span>
+                <span class="metric-val" id="valPacketRate">0 msg/s</span>
             </div>
-            <div class="stat-item">
-                <span class="stat-label">Total Sent</span>
-                <span class="stat-val pink" id="valSentCount">0</span>
+            <div class="metric-card">
+                <span class="metric-label">Total Data Ingested</span>
+                <span class="metric-val" id="valTotalData">0.00 MB</span>
             </div>
-            <div class="stat-item">
-                <span class="stat-label">Server Total Processed</span>
-                <span class="stat-val green" id="valServerTotal">0</span>
+            <div class="metric-card cyan">
+                <span class="metric-label">Total Packets Processed</span>
+                <span class="metric-val" id="valTotalPackets">0</span>
             </div>
         </div>
 
         <!-- Main Workspace -->
-        <div class="workspace-grid">
-            <!-- Left: Message Sender & Stress Controls -->
-            <div class="card">
-                <div class="card-header">
-                    <h2>💬 REAL-TIME SENDER</h2>
+        <div class="workspace">
+            <!-- Left: Heavy Generator Controls -->
+            <div class="panel">
+                <div class="panel-header">
+                    <h2>⚙️ HEAVY PRESSURE ENGINE</h2>
                 </div>
 
-                <!-- Instant Message Send -->
-                <div class="form-group">
-                    <label>Instant Message / Payload</label>
-                    <textarea id="txtManual" placeholder="Type message or JSON to broadcast... (e.g. Hello from Peer!)">Hello Real-Time WebSocket!</textarea>
-                </div>
-                <button class="btn btn-primary" id="btnSend">
-                    📤 BROADCAST NOW (Enter)
-                </button>
-
-                <hr style="border:none; border-top:1px solid rgba(255,255,255,0.08); margin: 20px 0;">
-
-                <!-- Stress Flood Controls -->
-                <div class="card-header" style="border:none; padding:0; margin-bottom:12px;">
-                    <h2>🔥 AUTO STRESS FLOODER</h2>
-                </div>
-
-                <div class="form-group">
+                <!-- Payload Size Selector -->
+                <div class="form-row">
                     <label>
-                        Sending Speed (Delay)
-                        <span id="txtDelay">10 ms (~100 msg/s)</span>
+                        Payload Data Size per Packet
+                        <span id="txtPayloadSize">25 KB per packet</span>
                     </label>
-                    <input type="range" id="rngDelay" min="2" max="200" value="10">
+                    <select id="selPayload">
+                        <option value="5">🔥 5 KB - Heavy Game Physics Frame (100 Entities)</option>
+                        <option value="25" selected>💥 25 KB - Massive Multi-State Array (500 Nodes)</option>
+                        <option value="50">⚡ 50 KB - Ultra Monster Telemetry (1,000 JSON Objects)</option>
+                        <option value="100">🌋 100 KB - Giant Blob Avalanche (2,000 Complex Structs)</option>
+                        <option value="250">💣 250 KB - Mega Memory Thrash Buffer</option>
+                    </select>
                 </div>
 
-                <button class="btn btn-stress" id="btnStress">
-                    🚀 START AUTO FLOOD (টানা পাঠাতে থাকো)
+                <!-- Millisecond Delay -->
+                <div class="form-row">
+                    <label>
+                        Sending Interval (Delay per burst)
+                        <span id="txtDelay">5 ms (Hyper ~200 Burst/s)</span>
+                    </label>
+                    <input type="range" id="rngDelay" min="1" max="100" value="5">
+                </div>
+
+                <!-- Concurrent Sockets -->
+                <div class="form-row">
+                    <label>
+                        Concurrent Parallel Sockets
+                        <span id="txtWorkers">5 Parallel Sockets</span>
+                    </label>
+                    <input type="range" id="rngWorkers" min="1" max="25" value="5">
+                </div>
+
+                <!-- Estimated Pressure -->
+                <div style="background:rgba(0,0,0,0.4); border:1px solid rgba(255,255,255,0.06); padding:12px; border-radius:8px; margin-bottom:16px; font-size:12px; font-family:'JetBrains Mono',monospace;">
+                    <div style="color:var(--neon-yellow); margin-bottom:4px;">📊 ESTIMATED TARGET PRESSURE:</div>
+                    <div style="color:var(--text-main)" id="txtTargetPressure">~25.0 MB/s Bandwidth Load</div>
+                </div>
+
+                <button id="btnToggle" class="btn-flood btn-start">
+                    🚀 START EXTREME PRESSURE (হাই প্রেশারে বড় ডাটা পাঠাও)
                 </button>
             </div>
 
-            <!-- Right: Real-time Live Stream View -->
-            <div class="card stream-card">
-                <div class="card-header">
-                    <h2>
-                        📺 LIVE REAL-TIME FEED
-                        <span style="font-size:12px; font-weight:normal; color:var(--text-muted);">(প্রতিটি মেসেজ সরাসরি রেন্ডার হচ্ছে)</span>
-                    </h2>
-                    <div class="stream-tools">
-                        <label style="font-size:12px; color:var(--text-muted); display:flex; align-items:center; gap:4px; cursor:pointer;">
-                            <input type="checkbox" id="chkAutoScroll" checked> Auto-Scroll
-                        </label>
-                        <button class="btn btn-clear" id="btnClear">Clear Stream</button>
+            <!-- Right: Live Packet Stream -->
+            <div class="panel stream-panel">
+                <div class="panel-header">
+                    <h2 style="color:var(--neon-cyan)">📺 REAL-TIME PACKET RENDER STREAM</h2>
+                    <div style="display:flex; gap:10px; align-items:center;">
+                        <button class="btn-clear" id="btnClear">Clear Feed</button>
                     </div>
                 </div>
 
-                <!-- Stream Box -->
-                <div class="stream-box" id="streamBox">
-                    <div class="msg-row system">
-                        <span class="msg-time">[SYSTEM]</span>
-                        <span class="msg-sender">SYSTEM</span>
-                        <span class="msg-content">WebSocket stream initialized. Connected to ws://localhost:8080/ws</span>
+                <div class="feed-box" id="feedBox">
+                    <div class="packet-row" style="border-left-color:var(--neon-cyan);">
+                        <div class="packet-header">
+                            <span style="color:var(--neon-cyan)">[SYSTEM] Connected to Extreme Go Server</span>
+                            <span class="packet-size">READY</span>
+                        </div>
+                        <div class="packet-preview">Server read buffer configured to 64 KB, packet limit up to 10 MB.</div>
                     </div>
                 </div>
             </div>
@@ -719,199 +722,194 @@ const htmlDashboard = `<!DOCTYPE html>
     </div>
 
     <script>
-        const streamBox = document.getElementById('streamBox');
-        const myPeerId = document.getElementById('myPeerId');
+        const btnToggle = document.getElementById('btnToggle');
         const statusDot = document.getElementById('statusDot');
-        const valOnline = document.getElementById('valOnline');
-        const valReceivedCount = document.getElementById('valReceivedCount');
-        const valLiveSpeed = document.getElementById('valLiveSpeed');
-        const valSentCount = document.getElementById('valSentCount');
-        const valServerTotal = document.getElementById('valServerTotal');
+        const statusLabel = document.getElementById('statusLabel');
+        const valServerMem = document.getElementById('valServerMem');
+        const valThroughput = document.getElementById('valThroughput');
+        const valPacketRate = document.getElementById('valPacketRate');
+        const valTotalData = document.getElementById('valTotalData');
+        const valTotalPackets = document.getElementById('valTotalPackets');
 
-        const txtManual = document.getElementById('txtManual');
-        const btnSend = document.getElementById('btnSend');
+        const selPayload = document.getElementById('selPayload');
+        const txtPayloadSize = document.getElementById('txtPayloadSize');
         const rngDelay = document.getElementById('rngDelay');
         const txtDelay = document.getElementById('txtDelay');
-        const btnStress = document.getElementById('btnStress');
+        const rngWorkers = document.getElementById('rngWorkers');
+        const txtWorkers = document.getElementById('txtWorkers');
+        const txtTargetPressure = document.getElementById('txtTargetPressure');
+        const feedBox = document.getElementById('feedBox');
         const btnClear = document.getElementById('btnClear');
-        const chkAutoScroll = document.getElementById('chkAutoScroll');
 
-        let ws = null;
-        let myClientId = null;
-        let receivedCount = 0;
-        let sentCount = 0;
-        let lastReceived = 0;
-        let isStressing = false;
-        let stressTimer = null;
-        let stressSeq = 0;
+        let isRunning = false;
+        let sockets = [];
+        let totalSentPackets = 0;
+        let totalSentBytes = 0;
+        let lastBytes = 0;
+        let lastPackets = 0;
+        let statTicker = null;
 
-        // WebSocket Connection
-        function connect() {
+        function updateEstimates() {
+            const kb = parseInt(selPayload.value);
+            const delay = parseInt(rngDelay.value);
+            const workers = parseInt(rngWorkers.value);
+            const pps = Math.round((workers * 1000) / delay);
+            const mbs = ((pps * kb) / 1024).toFixed(1);
+            txtPayloadSize.textContent = kb + ' KB per packet';
+            txtDelay.textContent = delay + ' ms (~' + pps + ' Packets/s)';
+            txtWorkers.textContent = workers + ' Parallel Sockets';
+            txtTargetPressure.textContent = '~' + mbs + ' MB/s Bandwidth (' + pps.toLocaleString() + ' Packets/s)';
+        }
+
+        selPayload.addEventListener('change', updateEstimates);
+        rngDelay.addEventListener('input', updateEstimates);
+        rngWorkers.addEventListener('input', updateEstimates);
+        updateEstimates();
+
+        // Heavy Payload Generator (creates realistic complex data matrices)
+        function generateHeavyPayload(kbSize, workerId, seq) {
+            const nodeCount = Math.floor((kbSize * 1024) / 120); // ~120 bytes per JSON element
+            const nodes = [];
+            const now = Date.now();
+
+            for (let i = 0; i < nodeCount; i++) {
+                nodes.push({
+                    id: 'node_' + i,
+                    x: (Math.random() * 2000).toFixed(2),
+                    y: (Math.random() * 2000).toFixed(2),
+                    vx: (Math.random() * 10 - 5).toFixed(2),
+                    vy: (Math.random() * 10 - 5).toFixed(2),
+                    hp: 100,
+                    hash: '0x' + Math.random().toString(16).substr(2, 8)
+                });
+            }
+
+            return JSON.stringify({
+                stressTest: "EXTREME_PRESSURE_BURST",
+                worker: workerId,
+                seq: seq,
+                timestamp: now,
+                payloadSizeKB: kbSize,
+                matrixCount: nodes.length,
+                entities: nodes
+            });
+        }
+
+        btnToggle.addEventListener('click', () => {
+            if (!isRunning) startExtremeStress();
+            else stopExtremeStress();
+        });
+
+        function startExtremeStress() {
+            isRunning = true;
+            btnToggle.textContent = '🛑 STOP PRESSURE (বন্ধ করো)';
+            btnToggle.className = 'btn-flood btn-stop';
+            statusDot.className = 'pulse-dot stressing';
+            statusLabel.textContent = 'MAX PRESSURE FLOOD ACTIVE 🔥';
+
+            const numWorkers = parseInt(rngWorkers.value);
+            const delay = parseInt(rngDelay.value);
+            const kbSize = parseInt(selPayload.value);
             const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-            ws = new WebSocket(proto + '//' + location.host + '/ws');
+            const wsUrl = proto + '//' + location.host + '/ws';
 
-            ws.onopen = () => {
-                statusDot.style.background = '#00ffcc';
-                myPeerId.textContent = 'Connecting Handshake...';
-            };
+            sockets = [];
+            for (let i = 0; i < numWorkers; i++) {
+                const workerId = 'W#' + (i + 1);
+                const ws = new WebSocket(wsUrl);
+                let seq = 0;
+                let timer = null;
 
-            ws.onmessage = (event) => {
-                receivedCount++;
-                valReceivedCount.textContent = receivedCount.toLocaleString();
+                ws.onopen = () => {
+                    timer = setInterval(() => {
+                        if (!isRunning || ws.readyState !== WebSocket.OPEN) return;
+                        seq++;
+                        const payload = generateHeavyPayload(kbSize, workerId, seq);
+                        ws.send(payload);
+                        totalSentPackets++;
+                        totalSentBytes += payload.length;
+                    }, delay);
+                };
+
+                ws.onmessage = (e) => {
+                    renderPacket(e.data);
+                };
+
+                sockets.push({ ws, timer });
+            }
+
+            // High-frequency telemetry sampler
+            statTicker = setInterval(async () => {
+                const diffBytes = totalSentBytes - lastBytes;
+                const diffPackets = totalSentPackets - lastPackets;
+                lastBytes = totalSentBytes;
+                lastPackets = totalSentPackets;
+
+                const liveMBs = (diffBytes / (1024 * 1024)).toFixed(2);
+                valThroughput.textContent = liveMBs + ' MB/s';
+                valPacketRate.textContent = diffPackets.toLocaleString() + ' msg/s';
+                valTotalData.textContent = (totalSentBytes / (1024 * 1024)).toFixed(2) + ' MB';
+                valTotalPackets.textContent = totalSentPackets.toLocaleString();
 
                 try {
-                    const data = JSON.parse(event.data);
-                    renderMessage(data);
-                } catch (e) {
-                    renderRawMessage(event.data);
+                    const res = await fetch('/api/stats');
+                    const stats = await res.json();
+                    if (stats.memoryAllocMB) valServerMem.textContent = stats.memoryAllocMB;
+                } catch(e) {}
+            }, 1000);
+        }
+
+        function stopExtremeStress() {
+            isRunning = false;
+            btnToggle.textContent = '🚀 START EXTREME PRESSURE (হাই প্রেশারে বড় ডাটা পাঠাও)';
+            btnToggle.className = 'btn-flood btn-start';
+            statusDot.className = 'pulse-dot';
+            statusLabel.textContent = 'STOPPED / IDLE';
+
+            sockets.forEach(s => {
+                if (s.timer) clearInterval(s.timer);
+                if (s.ws) s.ws.close();
+            });
+            sockets = [];
+
+            if (statTicker) clearInterval(statTicker);
+        }
+
+        let renderThrottle = 0;
+        function renderPacket(raw) {
+            renderThrottle++;
+            // Sample packets for UI to avoid freezing browser DOM under 50 MB/s load
+            if (renderThrottle % 3 !== 0) return;
+
+            try {
+                const data = JSON.parse(raw);
+                if (data.type === 'message') {
+                    const sizeKB = (data.size / 1024).toFixed(1);
+                    const row = document.createElement('div');
+                    row.className = 'packet-row';
+                    row.innerHTML = 
+                        '<div class="packet-header">' +
+                            '<span style="color:var(--neon-pink)">🔥 [' + data.timestamp + '] SENDER: ' + data.sender + '</span>' +
+                            '<span class="packet-size">📦 ' + sizeKB + ' KB (' + data.size.toLocaleString() + ' Bytes)</span>' +
+                        '</div>' +
+                        '<div class="packet-preview">' + escapeHtml(data.payload.substring(0, 180)) + '...</div>';
+
+                    feedBox.appendChild(row);
+                    if (feedBox.children.length > 50) {
+                        feedBox.removeChild(feedBox.firstChild);
+                    }
+                    feedBox.scrollTop = feedBox.scrollHeight;
                 }
-            };
-
-            ws.onclose = () => {
-                statusDot.style.background = '#ff0055';
-                myPeerId.textContent = 'Disconnected (Reconnecting...)';
-                setTimeout(connect, 2000);
-            };
-        }
-
-        // Render formatted message directly onto stream
-        function renderMessage(msg) {
-            if (msg.type === 'welcome') {
-                myClientId = msg.clientId;
-                myPeerId.textContent = 'ID: ' + myClientId;
-                return;
-            }
-
-            if (msg.type === 'system') {
-                if (msg.online !== undefined) {
-                    valOnline.textContent = msg.online;
-                }
-                appendRow('system', msg.timestamp || getTimestamp(), 'SYSTEM', msg.message);
-                return;
-            }
-
-            if (msg.type === 'message') {
-                const isMe = (msg.sender === myClientId);
-                const isStress = msg.payload && msg.payload.includes('STRESS');
-                const rowType = isMe ? 'self' : (isStress ? 'stress' : 'peer');
-                appendRow(rowType, msg.timestamp || getTimestamp(), msg.sender || 'PEER', msg.payload);
-            }
-        }
-
-        function renderRawMessage(raw) {
-            appendRow('peer', getTimestamp(), 'RAW', raw);
-        }
-
-        function appendRow(type, time, sender, content) {
-            const row = document.createElement('div');
-            row.className = 'msg-row ' + type;
-
-            let tag = '';
-            if (type === 'self') tag = '<span class="badge-tag" style="background:#ffe60022; color:#ffe600;">YOU</span>';
-            else if (type === 'stress') tag = '<span class="badge-tag" style="background:#ff005522; color:#ff0055;">BURST</span>';
-
-            row.innerHTML = 
-                '<span class="msg-time">[' + time + ']</span>' +
-                '<span class="msg-sender">' + tag + escapeHtml(sender) + '</span>' +
-                '<span class="msg-content">' + escapeHtml(content) + '</span>';
-
-            streamBox.appendChild(row);
-
-            // Limit DOM elements to keep browser fast during flood
-            if (streamBox.children.length > 300) {
-                streamBox.removeChild(streamBox.firstChild);
-            }
-
-            if (chkAutoScroll.checked) {
-                streamBox.scrollTop = streamBox.scrollHeight;
-            }
-        }
-
-        function getTimestamp() {
-            const d = new Date();
-            return d.toTimeString().split(' ')[0] + '.' + String(d.getMilliseconds()).padStart(3, '0');
+            } catch(e) {}
         }
 
         function escapeHtml(str) {
-            if (typeof str !== 'string') str = JSON.stringify(str);
             const div = document.createElement('div');
             div.innerText = str;
             return div.innerHTML;
         }
 
-        // Send manual message
-        function sendManual() {
-            const val = txtManual.value.trim();
-            if (val && ws && ws.readyState === WebSocket.OPEN) {
-                ws.send(val);
-                sentCount++;
-                valSentCount.textContent = sentCount.toLocaleString();
-            }
-        }
-
-        btnSend.addEventListener('click', sendManual);
-        txtManual.addEventListener('keydown', (e) => {
-            if (e.key === 'Enter' && !e.shiftKey) {
-                e.preventDefault();
-                sendManual();
-            }
-        });
-
-        // Stress Flooder
-        rngDelay.addEventListener('input', () => {
-            const delay = parseInt(rngDelay.value);
-            txtDelay.textContent = delay + ' ms (~' + Math.round(1000 / delay) + ' msg/s)';
-            if (isStressing) {
-                startStressTimer();
-            }
-        });
-
-        btnStress.addEventListener('click', () => {
-            if (!isStressing) {
-                isStressing = true;
-                btnStress.textContent = '🛑 STOP AUTO FLOOD (বন্ধ করো)';
-                btnStress.classList.add('running');
-                startStressTimer();
-            } else {
-                isStressing = false;
-                btnStress.textContent = '🚀 START AUTO FLOOD (টানা পাঠাতে থাকো)';
-                btnStress.classList.remove('running');
-                if (stressTimer) clearInterval(stressTimer);
-            }
-        });
-
-        function startStressTimer() {
-            if (stressTimer) clearInterval(stressTimer);
-            const delay = parseInt(rngDelay.value);
-            stressTimer = setInterval(() => {
-                if (!isStressing || !ws || ws.readyState !== WebSocket.OPEN) return;
-                stressSeq++;
-                const payload = 'STRESS_DATA_#' + stressSeq + ' | Time: ' + getTimestamp() + ' | Random: ' + Math.floor(Math.random() * 10000);
-                ws.send(payload);
-                sentCount++;
-                valSentCount.textContent = sentCount.toLocaleString();
-            }, delay);
-        }
-
-        btnClear.addEventListener('click', () => {
-            streamBox.innerHTML = '';
-        });
-
-        // Speed calculation ticker
-        setInterval(async () => {
-            const diff = receivedCount - lastReceived;
-            lastReceived = receivedCount;
-            valLiveSpeed.textContent = diff.toLocaleString() + ' msg/s';
-
-            try {
-                const res = await fetch('/api/stats');
-                const stats = await res.json();
-                valServerTotal.textContent = (stats.totalReceived || 0).toLocaleString();
-                if (stats.activeClients) valOnline.textContent = stats.activeClients;
-            } catch(e) {}
-        }, 1000);
-
-        connect();
+        btnClear.addEventListener('click', () => { feedBox.innerHTML = ''; });
     </script>
 </body>
 </html>
