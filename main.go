@@ -197,13 +197,13 @@ func main() {
 			return
 		}
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-		w.Write([]byte(htmlDarkTerminalFlooder))
+		w.Write([]byte(htmlScrollingTerminalFlooder))
 	})
 
 	addr := ":" + port
 	fmt.Printf("==============================================================\n")
-	fmt.Printf("⚡ 1MB Dark Terminal Flooder Server Online!\n")
-	fmt.Printf("🌐 Terminal Stream Page      : http://localhost:%s\n", port)
+	fmt.Printf("⚡ Live Rolling Terminal Flooder Server Online!\n")
+	fmt.Printf("🌐 Rolling Terminal Page     : http://localhost:%s\n", port)
 	fmt.Printf("📡 WebSocket Stream Endpoint : ws://localhost:%s/ws\n", port)
 	fmt.Printf("==============================================================\n")
 
@@ -219,22 +219,22 @@ func main() {
 	}
 }
 
-const htmlDarkTerminalFlooder = `<!DOCTYPE html>
+const htmlScrollingTerminalFlooder = `<!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>1MB High-Frequency Dark Terminal Stream</title>
+    <title>1MB Live Rolling Terminal Stream</title>
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
         body {
             background-color: #000000;
             color: #00ff66;
-            font-family: 'JetBrains Mono', 'Courier New', Courier, monospace;
+            font-family: 'Consolas', 'Courier New', monospace;
             height: 100vh;
             display: flex;
             flex-direction: column;
-            padding: 12px 16px;
+            padding: 10px 14px;
             overflow: hidden;
             user-select: none;
         }
@@ -244,91 +244,141 @@ const htmlDarkTerminalFlooder = `<!DOCTYPE html>
             display: flex;
             justify-content: space-between;
             align-items: center;
-            background: #080808;
-            border: 1px solid #1a2e1a;
+            background: #050505;
+            border: 1px solid #1a2a1a;
             border-bottom: 2px solid #00ff66;
             padding: 10px 18px;
-            font-size: 13px;
-            margin-bottom: 10px;
+            font-size: 14px;
+            margin-bottom: 8px;
             flex-shrink: 0;
         }
 
         .hud-left {
             display: flex;
             align-items: center;
-            gap: 16px;
+            gap: 12px;
         }
 
         .hud-dot {
-            width: 10px;
-            height: 10px;
+            width: 12px;
+            height: 12px;
             border-radius: 50%;
             background: #ff0055;
-            box-shadow: 0 0 12px #ff0055;
-            animation: pulse 0.3s infinite alternate;
+            box-shadow: 0 0 14px #ff0055;
+            animation: blink 0.25s infinite alternate;
         }
 
-        @keyframes pulse {
-            from { opacity: 0.4; }
+        @keyframes blink {
+            from { opacity: 0.3; }
             to { opacity: 1; }
         }
 
         .hud-speed {
             color: #ffffff;
             font-weight: 900;
-            font-size: 18px;
+            font-size: 20px;
             text-shadow: 0 0 10px #00ff66;
         }
 
         .hud-metrics {
             display: flex;
-            gap: 24px;
+            gap: 20px;
+            font-size: 13px;
         }
 
-        .metric-tag span {
-            color: #667788;
-        }
-        .metric-tag strong {
-            color: #00ffcc;
-            margin-left: 4px;
-        }
-        .metric-tag strong.sent { color: #ff0055; }
-        .metric-tag strong.recv { color: #ffe600; }
+        .metric-tag span { color: #667788; }
+        .metric-tag strong { color: #00ffcc; margin-left: 4px; }
+        .metric-tag strong.tx { color: #ff0055; }
+        .metric-tag strong.rx { color: #ffe600; }
 
-        /* Terminal Screen */
-        .terminal-container {
+        /* Rolling Terminal Container */
+        .terminal-viewport {
             flex: 1;
-            background: #030303;
+            background: #000000;
             border: 1px solid #112211;
-            border-radius: 4px;
-            padding: 12px 14px;
-            overflow-y: auto;
-            font-size: 12px;
-            line-height: 1.5;
+            padding: 10px 14px;
+            overflow: hidden;
             display: flex;
             flex-direction: column;
-            gap: 3px;
-            box-shadow: inset 0 0 40px rgba(0, 255, 102, 0.03);
+            justify-content: flex-end; /* Keeps items pushed upwards */
+            box-shadow: inset 0 0 50px rgba(0, 255, 102, 0.04);
         }
 
-        .t-line {
+        .stream-list {
             display: flex;
+            flex-direction: column;
+            gap: 4px;
+        }
+
+        /* Terminal Row Styles */
+        .t-row {
+            display: flex;
+            align-items: center;
             gap: 10px;
+            font-size: 13.5px;
+            line-height: 1.4;
             white-space: nowrap;
             overflow: hidden;
-            text-overflow: ellipsis;
+            animation: slideUp 0.1s ease-out;
         }
 
-        .t-time { color: #556677; min-width: 90px; }
-        .t-tx { color: #ff0055; }
-        .t-rx { color: #ffe600; }
-        .t-sys { color: #00b4d8; }
-        .t-data { color: #a0f0a0; }
-        .t-hash { color: #6688aa; }
+        @keyframes slideUp {
+            from { opacity: 0; transform: translateY(8px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
 
-        /* Bottom Footer */
+        .t-time {
+            color: #556677;
+            font-size: 12px;
+            min-width: 95px;
+        }
+
+        .t-badge {
+            padding: 2px 6px;
+            border-radius: 3px;
+            font-size: 11px;
+            font-weight: 900;
+            min-width: 100px;
+            text-align: center;
+        }
+
+        .t-badge.tx {
+            background: rgba(255, 0, 85, 0.2);
+            color: #ff0055;
+            border: 1px solid rgba(255, 0, 85, 0.4);
+        }
+
+        .t-badge.rx {
+            background: rgba(255, 230, 0, 0.2);
+            color: #ffe600;
+            border: 1px solid rgba(255, 230, 0, 0.4);
+        }
+
+        .t-badge.sys {
+            background: rgba(0, 180, 216, 0.2);
+            color: #00b4d8;
+            border: 1px solid rgba(0, 180, 216, 0.4);
+        }
+
+        .t-bytes {
+            color: #00ffcc;
+            font-weight: bold;
+            min-width: 135px;
+        }
+
+        .t-hex {
+            color: #88bb88;
+            font-weight: 500;
+        }
+
+        .t-chunk {
+            color: #667799;
+            font-size: 12px;
+        }
+
+        /* Footer */
         .footer-bar {
-            margin-top: 8px;
+            margin-top: 6px;
             font-size: 11px;
             color: #334455;
             display: flex;
@@ -343,34 +393,39 @@ const htmlDarkTerminalFlooder = `<!DOCTYPE html>
     <div class="hud-bar">
         <div class="hud-left">
             <div class="hud-dot"></div>
-            <span style="color:#ff0055; font-weight:bold;">AUTO 1MB FLOOD STREAM</span>
+            <span style="color:#ff0055; font-weight:bold;">AUTO 1MB ROLLING STREAM</span>
             <span>|</span>
             <span class="hud-speed" id="txtSpeed">0.00 MB/s</span>
         </div>
 
         <div class="hud-metrics">
-            <div class="metric-tag"><span>TX SENT:</span><strong class="sent" id="txtSent">0 MB</strong></div>
-            <div class="metric-tag"><span>RX RECV:</span><strong class="recv" id="txtRecv">0 MB</strong></div>
+            <div class="metric-tag"><span>TX SENT:</span><strong class="tx" id="txtSent">0 MB</strong></div>
+            <div class="metric-tag"><span>RX RECV:</span><strong class="rx" id="txtRecv">0 MB</strong></div>
             <div class="metric-tag"><span>PEERS:</span><strong id="txtPeers">1</strong></div>
             <div class="metric-tag"><span>SERVER TOTAL:</span><strong id="txtServerTotal">0 MB</strong></div>
         </div>
     </div>
 
-    <!-- Live Terminal Box -->
-    <div class="terminal-container" id="terminal">
-        <div class="t-line t-sys">
-            <span class="t-time">[SYS_INIT]</span>
-            <span>WebSocket 1MB Flooder Initializing. Connecting to ws://localhost:8080/ws...</span>
+    <!-- Live Rolling Stream -->
+    <div class="terminal-viewport">
+        <div class="stream-list" id="streamList">
+            <div class="t-row">
+                <span class="t-time">[INIT]</span>
+                <span class="t-badge sys">SYSTEM_INIT</span>
+                <span class="t-bytes">1,048,576 BYTES</span>
+                <span class="t-hex">57 45 42 53 4F 43 4B 45 54 5F 31 4D 42 5F 53 54 52 45 41 4D</span>
+                <span class="t-chunk">STATUS: INITIALIZED & READY</span>
+            </div>
         </div>
     </div>
 
     <div class="footer-bar">
-        <span>CHUNK SIZE: 1,048,576 BYTES (1.00 MB) | MILLISECOND CONTINUOUS LOOP | FULL-DUPLEX RELAY</span>
-        <span>STATUS: LIVE STREAMING</span>
+        <span>FRAME: 1,048,576 BYTES (1.00 MB) | MILLISECOND AVALANCHE | AUTO SLIDE & PURGE</span>
+        <span>STREAM: NO-CACHE ROLLING ACTIVE</span>
     </div>
 
     <script>
-        const terminal = document.getElementById('terminal');
+        const streamList = document.getElementById('streamList');
         const txtSpeed = document.getElementById('txtSpeed');
         const txtSent = document.getElementById('txtSent');
         const txtRecv = document.getElementById('txtRecv');
@@ -384,6 +439,8 @@ const htmlDarkTerminalFlooder = `<!DOCTYPE html>
         let txSeq = 0;
         let rxSeq = 0;
 
+        const MAX_LINES = 28; // Keep only latest 28 lines, older slide up & remove instantly
+
         const ONE_MB = 1024 * 1024;
         const oneMbBuffer = new Uint8Array(ONE_MB);
         for (let i = 0; i < ONE_MB; i++) {
@@ -395,21 +452,30 @@ const htmlDarkTerminalFlooder = `<!DOCTYPE html>
             return d.toTimeString().split(' ')[0] + '.' + String(d.getMilliseconds()).padStart(3, '0');
         }
 
-        function appendLine(typeClass, tag, text, hash) {
-            const line = document.createElement('div');
-            line.className = 't-line ' + typeClass;
-            line.innerHTML = 
-                '<span class="t-time">[' + getTime() + ']</span>' +
-                '<strong>' + tag + '</strong> ' +
-                '<span class="t-data">' + text + '</span> ' +
-                (hash ? '<span class="t-hash">' + hash + '</span>' : '');
-
-            terminal.appendChild(line);
-
-            if (terminal.children.length > 250) {
-                terminal.removeChild(terminal.firstChild);
+        function generateRandomHex() {
+            let h = '';
+            for (let i = 0; i < 16; i++) {
+                h += Math.floor(Math.random() * 256).toString(16).padStart(2, '0').toUpperCase() + ' ';
             }
-            terminal.scrollTop = terminal.scrollHeight;
+            return h.trim();
+        }
+
+        function addRow(badgeType, badgeText, hexText, chunkText) {
+            const row = document.createElement('div');
+            row.className = 't-row';
+            row.innerHTML = 
+                '<span class="t-time">[' + getTime() + ']</span>' +
+                '<span class="t-badge ' + badgeType + '">' + badgeText + '</span>' +
+                '<span class="t-bytes">1,048,576 BYTES</span>' +
+                '<span class="t-hex">' + hexText + '</span>' +
+                '<span class="t-chunk">' + chunkText + '</span>';
+
+            streamList.appendChild(row);
+
+            // Remove oldest line from top so it slides up and vanishes cleanly without caching
+            while (streamList.children.length > MAX_LINES) {
+                streamList.removeChild(streamList.firstChild);
+            }
         }
 
         const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
@@ -421,7 +487,7 @@ const htmlDarkTerminalFlooder = `<!DOCTYPE html>
             ws.binaryType = 'arraybuffer';
 
             ws.onopen = () => {
-                appendLine('t-sys', '[ONLINE]', 'Connected to Go WebSocket Hub. Launching immediate 1MB millisecond avalanche...');
+                addRow('sys', 'WS_CONNECTED', generateRandomHex(), 'ESTABLISHED 1MB BURST STREAM');
                 floodLoop();
             };
 
@@ -431,16 +497,14 @@ const htmlDarkTerminalFlooder = `<!DOCTYPE html>
                 totalRecvBytes += len;
                 rxSeq++;
 
-                // Render in terminal (throttled to avoid freezing DOM at 100+ MB/s)
                 rxThrottle++;
                 if (rxThrottle % 2 === 0) {
-                    const hash = '0x' + Math.random().toString(16).substr(2, 10).toUpperCase();
-                    appendLine('t-rx', '◀ [RX <- PEER]', 'Received 1,048,576 Bytes (1.00 MB) Chunk #' + rxSeq, 'SHA: ' + hash);
+                    addRow('rx', 'RX ◀ PEER', generateRandomHex(), 'CHUNK #' + rxSeq + ' [OK]');
                 }
             };
 
             ws.onclose = () => {
-                appendLine('t-sys', '[DISCONNECTED]', 'Connection closed. Reconnecting in 1s...');
+                addRow('sys', 'DISCONNECTED', generateRandomHex(), 'RETRYING CONNECT...');
                 setTimeout(connect, 1000);
             };
 
@@ -458,8 +522,7 @@ const htmlDarkTerminalFlooder = `<!DOCTYPE html>
 
                 txThrottle++;
                 if (txThrottle % 2 === 0) {
-                    const hash = '0x' + Math.random().toString(16).substr(2, 10).toUpperCase();
-                    appendLine('t-tx', '▶ [TX -> SERVER]', 'Pushed 1,048,576 Bytes (1.00 MB) Chunk #' + txSeq, 'BUFFER: ' + (ws.bufferedAmount/1024).toFixed(0) + 'KB ' + hash);
+                    addRow('tx', 'TX ▶ SERVER', generateRandomHex(), 'BLOCK #' + txSeq + ' [SENT]');
                 }
             }
 
