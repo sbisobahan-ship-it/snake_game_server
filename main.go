@@ -15,22 +15,28 @@ import (
 )
 
 var upgrader = websocket.Upgrader{
-	ReadBufferSize:  1024 * 1024,
-	WriteBufferSize: 1024 * 1024,
+	ReadBufferSize:  256 * 1024,
+	WriteBufferSize: 256 * 1024,
 	CheckOrigin: func(r *http.Request) bool {
 		return true
 	},
 }
 
+type PacketMessage struct {
+	SenderID string
+	Payload  []byte
+}
+
 type Client struct {
 	ID   string
+	Hub  *Hub
 	Conn *websocket.Conn
 	Send chan []byte
 }
 
 type Hub struct {
 	clients        map[*Client]bool
-	broadcast      chan []byte
+	broadcast      chan PacketMessage
 	register       chan *Client
 	unregister     chan *Client
 	mu             sync.RWMutex
@@ -45,7 +51,7 @@ type Hub struct {
 func NewHub() *Hub {
 	h := &Hub{
 		clients:    make(map[*Client]bool),
-		broadcast:  make(chan []byte, 2000),
+		broadcast:  make(chan PacketMessage, 5000),
 		register:   make(chan *Client, 128),
 		unregister: make(chan *Client, 128),
 	}
@@ -72,7 +78,9 @@ func (h *Hub) Run() {
 		case client := <-h.register:
 			h.mu.Lock()
 			h.clients[client] = true
+			total := len(h.clients)
 			h.mu.Unlock()
+			log.Printf("🔥 [Connected] %s | Active Clients: %d", client.ID, total)
 
 		case client := <-h.unregister:
 			h.mu.Lock()
@@ -80,17 +88,22 @@ func (h *Hub) Run() {
 				delete(h.clients, client)
 				close(client.Send)
 			}
+			total := len(h.clients)
 			h.mu.Unlock()
+			log.Printf("🛑 [Disconnected] %s | Active Clients: %d", client.ID, total)
 
-		case message := <-h.broadcast:
-			msgLen := uint64(len(message))
+		case pkt := <-h.broadcast:
+			msgLen := uint64(len(pkt.Payload))
 			h.mu.RLock()
 			for client := range h.clients {
-				select {
-				case client.Send <- message:
-					atomic.AddUint64(&h.totalSent, 1)
-					atomic.AddUint64(&h.totalBytesSent, msgLen)
-				default:
+				// Broadcast to ALL other peers (and even to self if only 1 client connected so they see response)
+				if client.ID != pkt.SenderID || len(h.clients) == 1 {
+					select {
+					case client.Send <- pkt.Payload:
+						atomic.AddUint64(&h.totalSent, 1)
+						atomic.AddUint64(&h.totalBytesSent, msgLen)
+					default:
+					}
 				}
 			}
 			h.mu.RUnlock()
@@ -104,9 +117,9 @@ func (h *Hub) ClientCount() int {
 	return len(h.clients)
 }
 
-func (c *Client) readPump(h *Hub) {
+func (c *Client) readPump() {
 	defer func() {
-		h.unregister <- c
+		c.Hub.unregister <- c
 		c.Conn.Close()
 	}()
 
@@ -118,11 +131,12 @@ func (c *Client) readPump(h *Hub) {
 			break
 		}
 		rawLen := uint64(len(raw))
-		atomic.AddUint64(&h.totalReceived, 1)
-		atomic.AddUint64(&h.totalBytesRecv, rawLen)
+		atomic.AddUint64(&c.Hub.totalReceived, 1)
+		atomic.AddUint64(&c.Hub.totalBytesRecv, rawLen)
 
+		// Broadcast packet to other peers
 		select {
-		case h.broadcast <- raw:
+		case c.Hub.broadcast <- PacketMessage{SenderID: c.ID, Payload: raw}:
 		default:
 		}
 	}
@@ -161,14 +175,15 @@ func main() {
 		clientID := fmt.Sprintf("PEER-%04d", time.Now().UnixNano()%10000)
 		client := &Client{
 			ID:   clientID,
+			Hub:  hub,
 			Conn: conn,
-			Send: make(chan []byte, 100),
+			Send: make(chan []byte, 500),
 		}
 
 		hub.register <- client
 
 		go client.writePump()
-		go client.readPump(hub)
+		go client.readPump()
 	})
 
 	mux.HandleFunc("/api/stats", func(w http.ResponseWriter, r *http.Request) {
@@ -197,13 +212,13 @@ func main() {
 			return
 		}
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-		w.Write([]byte(htmlScrollingTerminalFlooder))
+		w.Write([]byte(htmlRealTimePeerStream))
 	})
 
 	addr := ":" + port
 	fmt.Printf("==============================================================\n")
-	fmt.Printf("⚡ Live Rolling Terminal Flooder Server Online!\n")
-	fmt.Printf("🌐 Rolling Terminal Page     : http://localhost:%s\n", port)
+	fmt.Printf("⚡ Multi-Peer WebSocket Real-Time Relay Server Online!\n")
+	fmt.Printf("🌐 Peer Stream Dashboard    : http://localhost:%s\n", port)
 	fmt.Printf("📡 WebSocket Stream Endpoint : ws://localhost:%s/ws\n", port)
 	fmt.Printf("==============================================================\n")
 
@@ -219,12 +234,12 @@ func main() {
 	}
 }
 
-const htmlScrollingTerminalFlooder = `<!DOCTYPE html>
+const htmlRealTimePeerStream = `<!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>1MB Live Rolling Terminal Stream</title>
+    <title>⚡ Live Multi-Peer WebSocket Data Stream</title>
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
         body {
@@ -239,13 +254,13 @@ const htmlScrollingTerminalFlooder = `<!DOCTYPE html>
             user-select: none;
         }
 
-        /* Top HUD Bar */
+        /* Top HUD */
         .hud-bar {
             display: flex;
             justify-content: space-between;
             align-items: center;
-            background: #050505;
-            border: 1px solid #1a2a1a;
+            background: #060608;
+            border: 1px solid #142214;
             border-bottom: 2px solid #00ff66;
             padding: 10px 18px;
             font-size: 14px;
@@ -263,14 +278,19 @@ const htmlScrollingTerminalFlooder = `<!DOCTYPE html>
             width: 12px;
             height: 12px;
             border-radius: 50%;
+            background: #00ffcc;
+            box-shadow: 0 0 14px #00ffcc;
+            animation: blink 0.4s infinite alternate;
+        }
+
+        .hud-dot.active {
             background: #ff0055;
-            box-shadow: 0 0 14px #ff0055;
-            animation: blink 0.25s infinite alternate;
+            box-shadow: 0 0 16px #ff0055;
         }
 
         @keyframes blink {
-            from { opacity: 0.3; }
-            to { opacity: 1; }
+            from { opacity: 0.3; transform: scale(0.9); }
+            to { opacity: 1; transform: scale(1.2); }
         }
 
         .hud-speed {
@@ -282,8 +302,8 @@ const htmlScrollingTerminalFlooder = `<!DOCTYPE html>
 
         .hud-metrics {
             display: flex;
-            gap: 20px;
-            font-size: 13px;
+            gap: 24px;
+            font-size: 13.5px;
         }
 
         .metric-tag span { color: #667788; }
@@ -291,17 +311,17 @@ const htmlScrollingTerminalFlooder = `<!DOCTYPE html>
         .metric-tag strong.tx { color: #ff0055; }
         .metric-tag strong.rx { color: #ffe600; }
 
-        /* Rolling Terminal Container */
+        /* Terminal Screen */
         .terminal-viewport {
             flex: 1;
-            background: #000000;
-            border: 1px solid #112211;
+            background: #020204;
+            border: 1px solid #0f1c0f;
             padding: 10px 14px;
             overflow: hidden;
             display: flex;
             flex-direction: column;
-            justify-content: flex-end; /* Keeps items pushed upwards */
-            box-shadow: inset 0 0 50px rgba(0, 255, 102, 0.04);
+            justify-content: flex-end;
+            box-shadow: inset 0 0 50px rgba(0, 255, 102, 0.03);
         }
 
         .stream-list {
@@ -310,7 +330,6 @@ const htmlScrollingTerminalFlooder = `<!DOCTYPE html>
             gap: 4px;
         }
 
-        /* Terminal Row Styles */
         .t-row {
             display: flex;
             align-items: center;
@@ -319,11 +338,11 @@ const htmlScrollingTerminalFlooder = `<!DOCTYPE html>
             line-height: 1.4;
             white-space: nowrap;
             overflow: hidden;
-            animation: slideUp 0.1s ease-out;
+            animation: slideUp 0.08s ease-out;
         }
 
         @keyframes slideUp {
-            from { opacity: 0; transform: translateY(8px); }
+            from { opacity: 0; transform: translateY(6px); }
             to { opacity: 1; transform: translateY(0); }
         }
 
@@ -334,49 +353,48 @@ const htmlScrollingTerminalFlooder = `<!DOCTYPE html>
         }
 
         .t-badge {
-            padding: 2px 6px;
+            padding: 2px 8px;
             border-radius: 3px;
             font-size: 11px;
             font-weight: 900;
-            min-width: 100px;
+            min-width: 110px;
             text-align: center;
         }
 
         .t-badge.tx {
             background: rgba(255, 0, 85, 0.2);
             color: #ff0055;
-            border: 1px solid rgba(255, 0, 85, 0.4);
+            border: 1px solid rgba(255, 0, 85, 0.5);
         }
 
         .t-badge.rx {
             background: rgba(255, 230, 0, 0.2);
             color: #ffe600;
-            border: 1px solid rgba(255, 230, 0, 0.4);
+            border: 1px solid rgba(255, 230, 0, 0.5);
         }
 
         .t-badge.sys {
             background: rgba(0, 180, 216, 0.2);
             color: #00b4d8;
-            border: 1px solid rgba(0, 180, 216, 0.4);
+            border: 1px solid rgba(0, 180, 216, 0.5);
         }
 
         .t-bytes {
             color: #00ffcc;
             font-weight: bold;
-            min-width: 135px;
+            min-width: 120px;
         }
 
         .t-hex {
-            color: #88bb88;
+            color: #77dd77;
             font-weight: 500;
         }
 
         .t-chunk {
-            color: #667799;
+            color: #8899bb;
             font-size: 12px;
         }
 
-        /* Footer */
         .footer-bar {
             margin-top: 6px;
             font-size: 11px;
@@ -389,48 +407,47 @@ const htmlScrollingTerminalFlooder = `<!DOCTYPE html>
     </style>
 </head>
 <body>
-    <!-- Top HUD Telemetry -->
     <div class="hud-bar">
         <div class="hud-left">
-            <div class="hud-dot"></div>
-            <span style="color:#ff0055; font-weight:bold;">AUTO 1MB ROLLING STREAM</span>
+            <div class="hud-dot active" id="dotStatus"></div>
+            <span style="color:#ff0055; font-weight:bold;">LIVE PEER STREAM</span>
             <span>|</span>
             <span class="hud-speed" id="txtSpeed">0.00 MB/s</span>
         </div>
 
         <div class="hud-metrics">
-            <div class="metric-tag"><span>TX SENT:</span><strong class="tx" id="txtSent">0 MB</strong></div>
-            <div class="metric-tag"><span>RX RECV:</span><strong class="rx" id="txtRecv">0 MB</strong></div>
-            <div class="metric-tag"><span>PEERS:</span><strong id="txtPeers">1</strong></div>
-            <div class="metric-tag"><span>SERVER TOTAL:</span><strong id="txtServerTotal">0 MB</strong></div>
+            <div class="metric-tag"><span>MY PEER ID:</span><strong id="txtMyPeer">PEER-INIT</strong></div>
+            <div class="metric-tag"><span>TX SENT:</span><strong class="tx" id="txtSent">0.0 MB</strong></div>
+            <div class="metric-tag"><span>RX RECV:</span><strong class="rx" id="txtRecv">0.0 MB</strong></div>
+            <div class="metric-tag"><span>ONLINE PEERS:</span><strong id="txtPeers">1</strong></div>
         </div>
     </div>
 
-    <!-- Live Rolling Stream -->
+    <!-- Live Terminal -->
     <div class="terminal-viewport">
         <div class="stream-list" id="streamList">
             <div class="t-row">
                 <span class="t-time">[INIT]</span>
-                <span class="t-badge sys">SYSTEM_INIT</span>
-                <span class="t-bytes">1,048,576 BYTES</span>
-                <span class="t-hex">57 45 42 53 4F 43 4B 45 54 5F 31 4D 42 5F 53 54 52 45 41 4D</span>
-                <span class="t-chunk">STATUS: INITIALIZED & READY</span>
+                <span class="t-badge sys">SYS_CONNECTED</span>
+                <span class="t-bytes">65,536 BYTES</span>
+                <span class="t-hex">57 53 5F 53 54 52 45 41 4D 5F 4C 49 56 45 5F 4F 4E 4C 49 4E 45</span>
+                <span class="t-chunk">REAL-TIME TWO-WAY DATA RELAY READY</span>
             </div>
         </div>
     </div>
 
     <div class="footer-bar">
-        <span>FRAME: 1,048,576 BYTES (1.00 MB) | MILLISECOND AVALANCHE | AUTO SLIDE & PURGE</span>
-        <span>STREAM: NO-CACHE ROLLING ACTIVE</span>
+        <span>FRAME: 65,536 BYTES (64 KB BURST) | CONTINUOUS MILLISECOND LOOP | FULL P2P RELAY</span>
+        <span>STATUS: LIVE TRANSMITTING & RECEIVING</span>
     </div>
 
     <script>
         const streamList = document.getElementById('streamList');
         const txtSpeed = document.getElementById('txtSpeed');
+        const txtMyPeer = document.getElementById('txtMyPeer');
         const txtSent = document.getElementById('txtSent');
         const txtRecv = document.getElementById('txtRecv');
         const txtPeers = document.getElementById('txtPeers');
-        const txtServerTotal = document.getElementById('txtServerTotal');
 
         let totalSentBytes = 0;
         let totalRecvBytes = 0;
@@ -439,12 +456,19 @@ const htmlScrollingTerminalFlooder = `<!DOCTYPE html>
         let txSeq = 0;
         let rxSeq = 0;
 
-        const MAX_LINES = 28; // Keep only latest 28 lines, older slide up & remove instantly
+        const MAX_LINES = 28;
 
-        const ONE_MB = 1024 * 1024;
-        const oneMbBuffer = new Uint8Array(ONE_MB);
-        for (let i = 0; i < ONE_MB; i++) {
-            oneMbBuffer[i] = (i % 256);
+        // 64 KB Frame chunk size (ideal balance: high MB/s speed without freezing browser UI)
+        const FRAME_SIZE = 64 * 1024;
+        const myPeerId = 'PEER-' + Math.floor(1000 + Math.random() * 9000);
+        txtMyPeer.textContent = myPeerId;
+
+        // Prepare frame with sender ID tag
+        const frameHeader = new TextEncoder().encode('SENDER:' + myPeerId + '|');
+        const frameBuffer = new Uint8Array(FRAME_SIZE);
+        frameBuffer.set(frameHeader, 0);
+        for (let i = frameHeader.length; i < FRAME_SIZE; i++) {
+            frameBuffer[i] = (i % 256);
         }
 
         function getTime() {
@@ -466,13 +490,12 @@ const htmlScrollingTerminalFlooder = `<!DOCTYPE html>
             row.innerHTML = 
                 '<span class="t-time">[' + getTime() + ']</span>' +
                 '<span class="t-badge ' + badgeType + '">' + badgeText + '</span>' +
-                '<span class="t-bytes">1,048,576 BYTES</span>' +
+                '<span class="t-bytes">65,536 BYTES</span>' +
                 '<span class="t-hex">' + hexText + '</span>' +
                 '<span class="t-chunk">' + chunkText + '</span>';
 
             streamList.appendChild(row);
 
-            // Remove oldest line from top so it slides up and vanishes cleanly without caching
             while (streamList.children.length > MAX_LINES) {
                 streamList.removeChild(streamList.firstChild);
             }
@@ -487,46 +510,53 @@ const htmlScrollingTerminalFlooder = `<!DOCTYPE html>
             ws.binaryType = 'arraybuffer';
 
             ws.onopen = () => {
-                addRow('sys', 'WS_CONNECTED', generateRandomHex(), 'ESTABLISHED 1MB BURST STREAM');
+                addRow('sys', 'WS_RELAY_ON', generateRandomHex(), 'CONNECT OK | AUTO BROADCAST STREAMING');
                 floodLoop();
             };
 
-            let rxThrottle = 0;
             ws.onmessage = (event) => {
-                const len = event.data.byteLength || event.data.length || ONE_MB;
+                const len = event.data.byteLength || event.data.length || FRAME_SIZE;
                 totalRecvBytes += len;
                 rxSeq++;
 
-                rxThrottle++;
-                if (rxThrottle % 2 === 0) {
-                    addRow('rx', 'RX ◀ PEER', generateRandomHex(), 'CHUNK #' + rxSeq + ' [OK]');
+                // Extract peer tag if available
+                let fromPeer = 'REMOTE_PEER';
+                try {
+                    const strHeader = new TextDecoder().decode(new Uint8Array(event.data.slice(0, 24)));
+                    if (strHeader.startsWith('SENDER:')) {
+                        fromPeer = strHeader.split('|')[0].replace('SENDER:', '');
+                    }
+                } catch(e) {}
+
+                if (rxSeq % 2 === 0) {
+                    addRow('rx', 'RX ◀ ' + fromPeer, generateRandomHex(), 'FRAME #' + rxSeq + ' [INGESTED]');
                 }
             };
 
             ws.onclose = () => {
-                addRow('sys', 'DISCONNECTED', generateRandomHex(), 'RETRYING CONNECT...');
+                addRow('sys', 'DISCONNECTED', generateRandomHex(), 'RETRYING CONNECT IN 1s...');
                 setTimeout(connect, 1000);
             };
 
             ws.onerror = () => {};
         }
 
-        let txThrottle = 0;
         function floodLoop() {
             if (!ws || ws.readyState !== WebSocket.OPEN) return;
 
-            if (ws.bufferedAmount < 4 * ONE_MB) {
-                ws.send(oneMbBuffer);
-                totalSentBytes += ONE_MB;
+            // Send 64KB frame
+            if (ws.bufferedAmount < 512 * 1024) {
+                ws.send(frameBuffer);
+                totalSentBytes += FRAME_SIZE;
                 txSeq++;
 
-                txThrottle++;
-                if (txThrottle % 2 === 0) {
-                    addRow('tx', 'TX ▶ SERVER', generateRandomHex(), 'BLOCK #' + txSeq + ' [SENT]');
+                if (txSeq % 2 === 0) {
+                    addRow('tx', 'TX ▶ TO PEERS', generateRandomHex(), 'FRAME #' + txSeq + ' [TRANSMITTED]');
                 }
             }
 
-            setTimeout(floodLoop, 1);
+            // Continuous loop
+            setTimeout(floodLoop, 10);
         }
 
         // Stats updater
@@ -539,14 +569,13 @@ const htmlScrollingTerminalFlooder = `<!DOCTYPE html>
             const totalSpeed = ((diffSent + diffRecv) / (1024 * 1024)).toFixed(2);
             txtSpeed.textContent = totalSpeed + ' MB/s';
 
-            txtSent.textContent = (totalSentBytes / (1024 * 1024)).toFixed(0) + ' MB';
-            txtRecv.textContent = (totalRecvBytes / (1024 * 1024)).toFixed(0) + ' MB';
+            txtSent.textContent = (totalSentBytes / (1024 * 1024)).toFixed(1) + ' MB';
+            txtRecv.textContent = (totalRecvBytes / (1024 * 1024)).toFixed(1) + ' MB';
 
             try {
                 const res = await fetch('/api/stats');
                 const data = await res.json();
                 if (data.activeClients !== undefined) txtPeers.textContent = data.activeClients;
-                if (data.totalMBRecv) txtServerTotal.textContent = data.totalMBRecv;
             } catch(e) {}
         }, 1000);
 
