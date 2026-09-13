@@ -3,6 +3,7 @@ package network
 import (
 	"encoding/json"
 	"log"
+	"net"
 	"sync"
 	"time"
 
@@ -27,10 +28,11 @@ type Client struct {
 	ID        string
 	Conn      *websocket.Conn
 	Send      chan WSMessage
+	done      chan struct{} // Closed when client disconnects to instantly terminate WritePump
 	onMessage func(c *Client, msgType int, raw []byte)
 	onClose   func(c *Client)
 	mu        sync.Mutex
-	writeMu   sync.Mutex // Serializes data writes (WriteMessage) to avoid concurrent writes
+	writeMu   sync.Mutex // Serializes all writes (WriteMessage and WriteControl) to avoid concurrent write collisions
 	isClosed  bool
 }
 
@@ -39,23 +41,39 @@ func NewClient(id string, conn *websocket.Conn, onMessage func(c *Client, msgTyp
 	return &Client{
 		ID:        id,
 		Conn:      conn,
-		Send:      make(chan WSMessage, 1024),
+		Send:      make(chan WSMessage, 512),
+		done:      make(chan struct{}),
 		onMessage: onMessage,
 		onClose:   onClose,
 	}
 }
 
-// safeWriteMessage writes a data message with serialized writeMu protection
+// safeWriteMessage writes a message with serialized writeMu protection
 func (c *Client) safeWriteMessage(msgType int, data []byte) error {
+	c.mu.Lock()
+	if c.isClosed {
+		c.mu.Unlock()
+		return net.ErrClosed
+	}
+	c.mu.Unlock()
+
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()
 	c.Conn.SetWriteDeadline(time.Now().Add(writeWait))
 	return c.Conn.WriteMessage(msgType, data)
 }
 
-// safeWriteControl writes a control frame (Ping, Pong, Close).
-// Gorilla WebSocket handles WriteControl concurrently without external mutex.
+// safeWriteControl writes a control frame (e.g. Pong) with serialized writeMu protection
 func (c *Client) safeWriteControl(msgType int, data []byte) error {
+	c.mu.Lock()
+	if c.isClosed {
+		c.mu.Unlock()
+		return net.ErrClosed
+	}
+	c.mu.Unlock()
+
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
 	return c.Conn.WriteControl(msgType, data, time.Now().Add(writeWait))
 }
 
@@ -73,7 +91,7 @@ func (c *Client) ReadPump() {
 		return nil
 	})
 
-	// When client sends Ping (e.g. OkHttp pingInterval), reply with Pong safely
+	// When client sends Ping (e.g. OkHttp pingInterval), reply with Pong safely without colliding with WritePump
 	c.Conn.SetPingHandler(func(appData string) error {
 		c.Conn.SetReadDeadline(time.Now().Add(pongWait))
 		return c.safeWriteControl(websocket.PongMessage, []byte(appData))
@@ -103,6 +121,10 @@ func (c *Client) WritePump() {
 
 	for {
 		select {
+		case <-c.done:
+			// Instantly terminate WritePump when client connection is closed
+			return
+
 		case msg, ok := <-c.Send:
 			if !ok {
 				c.safeWriteControl(websocket.CloseMessage, []byte{})
@@ -110,13 +132,11 @@ func (c *Client) WritePump() {
 			}
 
 			if err := c.safeWriteMessage(msg.MsgType, msg.Data); err != nil {
-				log.Printf("⚠️ [WritePump Send Error] Client: %s | Error: %v", c.ID, err)
 				return
 			}
 
 		case <-ticker.C:
 			if err := c.safeWriteControl(websocket.PingMessage, []byte{}); err != nil {
-				log.Printf("⚠️ [WritePump Ping Error] Client: %s | Error: %v", c.ID, err)
 				return
 			}
 		}
@@ -177,6 +197,7 @@ func (c *Client) Close() {
 		return
 	}
 	c.isClosed = true
+	close(c.done) // Instantly terminate WritePump
 	c.mu.Unlock()
 
 	c.Conn.Close()

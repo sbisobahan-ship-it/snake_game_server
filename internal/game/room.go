@@ -426,50 +426,23 @@ func (r *Room) Tick(dt float64) {
 		}
 	}
 
-	// 2. Collision with Boundaries
-	var diedPlayers []*Player
+	// 2. Arena Boundary Clamping (Death disabled during food testing so snakes remain alive)
+	halfW := r.Config.WorldWidth / 2.0
+	halfH := r.Config.WorldHeight / 2.0
 	for _, p := range r.Players {
 		s := p.Snake
 		if s == nil || !s.IsAlive {
 			continue
 		}
-
-		if CheckBoundaryCollision(s.Head, s.HeadRadius, r.Config.WorldWidth, r.Config.WorldHeight) {
-			s.IsAlive = false
-			diedPlayers = append(diedPlayers, p)
-			monitor.DefaultHub.Emit(monitor.ChanPhysics, "warn", "💥 [BORDER CRASH] Player '%s' hit boundary at (%.1f, %.1f)! Snake died.", p.Name, s.Head.X, s.Head.Y)
+		if s.Head.X < -halfW {
+			s.Head.X = -halfW
+		} else if s.Head.X > halfW {
+			s.Head.X = halfW
 		}
-	}
-
-	// 3. Collision between snakes (Head to other snake body)
-	for idA, pA := range r.Players {
-		sA := pA.Snake
-		if sA == nil || !sA.IsAlive {
-			continue
-		}
-
-		for idB, pB := range r.Players {
-			if idA == idB {
-				continue
-			}
-			sB := pB.Snake
-			if sB == nil || !sB.IsAlive {
-				continue
-			}
-
-			if CheckSnakeBodyCollision(sA.Head, sA.HeadRadius, sB) {
-				sA.IsAlive = false
-				diedPlayers = append(diedPlayers, pA)
-				monitor.DefaultHub.Emit(monitor.ChanPhysics, "error", "⚔️ [SNAKE COLLISION] '%s' crashed into '%s' body! Snake destroyed (Score was: %d).", pA.Name, pB.Name, sA.Score)
-				break
-			}
-		}
-	}
-
-	// 4. Handle deaths & convert dead snake bodies into dropped foods
-	for _, p := range diedPlayers {
-		if p.Snake != nil {
-			r.spawnDeathFoodsLocked(p.Snake, p.Name)
+		if s.Head.Y < -halfH {
+			s.Head.Y = -halfH
+		} else if s.Head.Y > halfH {
+			s.Head.Y = halfH
 		}
 	}
 

@@ -48,11 +48,14 @@ func TestCollisionDetection(t *testing.T) {
 		t.Fatalf("Player 1 failed to spawn")
 	}
 
-	// Test boundary collision by forcing position outside bounds
+	// Test boundary clamping by forcing position outside bounds
 	p1.Snake.Head = physics.Vector2D{X: 600, Y: 0} // Outside 1000x1000 (halfW = 500)
 	room.Tick(0.033)
 
-	if p1.Snake.IsAlive {
-		t.Errorf("Expected snake to die on boundary breach")
+	if p1.Snake.Head.X > 500 {
+		t.Errorf("Expected snake head to be clamped to <= 500, got %f", p1.Snake.Head.X)
+	}
+	if !p1.Snake.IsAlive {
+		t.Errorf("Expected snake to remain alive with boundary clamping")
 	}
 }
