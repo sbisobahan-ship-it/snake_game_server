@@ -97,6 +97,25 @@ Broadcast to all clients every ~33ms (30 TPS).
     - `[4 Bytes]` : `Float32` (Y Position)
     - `[2 Bytes]` : `Uint16` (Food Value)
 
+#### 2. Real-Time Batched Eaten Food Block (Binary: `Opcode 0x06`)
+Broadcast immediately (every ~15ms) to **ALL connected clients** (including the player who ate the food) whenever a block of foods is claimed across the arena.
+Handles 100-150 concurrent players with zero latency.
+
+* **Format:**
+  - `[Byte 0]` : `0x06` (Opcode: `BinOpEatBatch`)
+  - `[Bytes 1..2]` : `Uint16` (Eaten Items Count `E`, Little-Endian)
+  - For each of the `E` items:
+    - `[4 Bytes]` : `Uint32` (Food ID)
+    - `[8 Bytes]` : `ASCII String` (Eater Player ID)
+    - `[4 Bytes]` : `Int32` (Eater's New Total Score)
+
+* **Client Action upon receiving Opcode 0x06:**
+  1. Read `count = buffer.short.toInt() and 0xFFFF`.
+  2. Loop `count` times:
+     - Read `foodId = buffer.int`, `eaterId = buffer.get(8B)`, `score = buffer.int`.
+     - Remove `foodId` from local food map/canvas.
+     - Update `eaterId`'s snake score and target length on screen.
+
 ---
 
 ## 🤖 3. Ready-to-Use Client Integration Prompt

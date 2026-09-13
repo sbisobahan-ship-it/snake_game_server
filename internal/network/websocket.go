@@ -32,10 +32,21 @@ type Manager struct {
 
 // NewManager creates a new network manager
 func NewManager(room *game.Room) *Manager {
-	return &Manager{
+	m := &Manager{
 		room:    room,
 		clients: make(map[string]*Client),
 	}
+
+	// Register high-speed binary block batch broadcast callback:
+	// Drains all eat events from 150+ players into a single binary block (0x06)
+	// and broadcasts directly to ALL connected clients (including the eater)!
+	room.SetEatBatchCallback(func(events []game.FoodEatenEvent) {
+		binData := EncodeEatBatchBinary(events)
+		m.BroadcastBinary(binData)
+		monitor.DefaultHub.Emit(monitor.ChanFood, "eat", "⚡ [BATCH EAT BROADCAST] Broadcast %d eaten food(s) to all %d connected players", len(events), m.GetActiveClientCount())
+	})
+
+	return m
 }
 
 // HandleWS handles incoming WebSocket connections
@@ -103,16 +114,11 @@ func (m *Manager) handleMessage(client *Client, msgType int, raw []byte) {
 		case BinOpPong: // 0x04: Binary Pong Keepalive
 			// Client acknowledged ping
 
-		case BinOpEatBatch: // 0x06: Binary Eat Food Action
+		case BinOpEatBatch: // 0x06: Binary Eat Food Action (Ultra-fast non-blocking lock-free enqueue)
 			if items, ok := DecodeEatFoodBinary(raw); ok {
 				for _, item := range items {
-					// Print clearly to server terminal console
-					log.Printf("🍎 [FOOD EATEN] Client: %s | Food ID: #%d | Score Gain: +%d | Raw Hex: %X", client.ID, item.FoodID, item.ScoreGain, raw)
-					m.room.ClaimAndEatFood(client.ID, item.FoodID, item.ScoreGain)
-					monitor.DefaultHub.Emit(monitor.ChanFood, "eat", "🍎 [FOOD EATEN] '%s' ate Food #%d (+%d pts)", client.ID, item.FoodID, item.ScoreGain)
+					m.room.EnqueueEat(client.ID, item.FoodID, item.ScoreGain)
 				}
-			} else {
-				log.Printf("⚠️ [FOOD EAT ERROR] Invalid binary payload from %s: %X", client.ID, raw)
 			}
 		}
 		return

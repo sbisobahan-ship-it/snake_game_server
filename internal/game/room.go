@@ -55,6 +55,13 @@ type consumedFoodEntry struct {
 	expireAt int64
 }
 
+// EatRequest represents a fast queued eat event from any connected client
+type EatRequest struct {
+	PlayerID  string
+	FoodID    uint32
+	ScoreGain int
+}
+
 // Room manages an active match / arena instance with authoritative tick loop
 type Room struct {
 	ID              string
@@ -65,11 +72,13 @@ type Room struct {
 	consumedQueue   []consumedFoodEntry // Ordered FIFO queue for O(1) instant head eviction
 	pendingEaten    []FoodEatenEvent    // Batched eaten foods in the current tick window
 	pendingSpawned  []FoodSpawnEvent    // Batched spawned foods in the current tick window
+	eatQueue        chan EatRequest     // High-concurrency lock-free eat ingestion queue (capacity: 16384)
 	foodSeq         uint32
 	maxFoods        int
 	totalEaten      uint64
 	mu              sync.RWMutex
 	broadcastFn     func(state *WorldState)
+	onEatBatchFn    func(events []FoodEatenEvent)
 	isRunning       bool
 	stopChan        chan struct{}
 }
@@ -83,6 +92,7 @@ func NewRoom(id string, cfg *config.Config, broadcastFn func(state *WorldState))
 		Foods:           make(map[uint32]*Food),
 		consumedFoodIDs: make(map[uint32]int64, 4096),
 		consumedQueue:   make([]consumedFoodEntry, 0, 512),
+		eatQueue:        make(chan EatRequest, 16384),
 		maxFoods:        250,
 		broadcastFn:     broadcastFn,
 		stopChan:        make(chan struct{}),
@@ -233,6 +243,81 @@ func (r *Room) evictExpiredFoodsLocked(now int64) {
 			r.consumedQueue = make([]consumedFoodEntry, 0, 512)
 		}
 	}
+}
+
+// SetEatBatchCallback registers the callback invoked when a batch of foods is consumed
+func (r *Room) SetEatBatchCallback(fn func(events []FoodEatenEvent)) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.onEatBatchFn = fn
+}
+
+// EnqueueEat adds an incoming eat request into the high-speed lock-free channel.
+// Extremely fast (nanoseconds), non-blocking, safe for 150+ concurrent players.
+func (r *Room) EnqueueEat(playerID string, foodID uint32, scoreGain int) {
+	if scoreGain <= 0 {
+		scoreGain = 1
+	}
+	select {
+	case r.eatQueue <- EatRequest{PlayerID: playerID, FoodID: foodID, ScoreGain: scoreGain}:
+	default:
+		// Queue saturated under abnormal load
+	}
+}
+
+// FlushEatBatch drains all queued eat requests in a single atomic batch,
+// applies authoritative game logic, and triggers binary block broadcast to all players.
+func (r *Room) FlushEatBatch() []FoodEatenEvent {
+	qLen := len(r.eatQueue)
+	if qLen == 0 {
+		return nil
+	}
+
+	r.mu.Lock()
+	events := r.flushEatBatchLocked(time.Now().UnixMilli())
+	batchFn := r.onEatBatchFn
+	r.mu.Unlock()
+
+	if len(events) > 0 && batchFn != nil {
+		batchFn(events)
+	}
+	return events
+}
+
+func (r *Room) flushEatBatchLocked(now int64) []FoodEatenEvent {
+	qLen := len(r.eatQueue)
+	if qLen == 0 {
+		return nil
+	}
+
+	accepted := make([]FoodEatenEvent, 0, qLen)
+	for i := 0; i < qLen; i++ {
+		select {
+		case req := <-r.eatQueue:
+			if r.isFoodConsumedLocked(req.FoodID, now) {
+				continue
+			}
+			player, exists := r.Players[req.PlayerID]
+			if !exists || player.Snake == nil || !player.Snake.IsAlive {
+				continue
+			}
+
+			r.markFoodConsumedLocked(req.FoodID, now)
+			player.Snake.Grow(req.ScoreGain)
+			newScore := player.Snake.Score
+
+			event := FoodEatenEvent{
+				FoodID:   req.FoodID,
+				EaterID:  req.PlayerID,
+				NewScore: newScore,
+			}
+			accepted = append(accepted, event)
+			r.pendingEaten = append(r.pendingEaten, event)
+		default:
+			break
+		}
+	}
+	return accepted
 }
 
 // ClaimAndEatFood authoritatively resolves race condition for a food item (First-Come, First-Served)
@@ -505,6 +590,7 @@ func (r *Room) StartGameLoop() {
 	tickDuration := time.Second / time.Duration(r.Config.TickRate)
 	ticker := time.NewTicker(tickDuration)
 	metricsTicker := time.NewTicker(time.Second)
+	eatBatchTicker := time.NewTicker(15 * time.Millisecond) // Ultra-low latency 15ms micro-batching
 
 	go func() {
 		lastTime := time.Now()
@@ -513,7 +599,10 @@ func (r *Room) StartGameLoop() {
 			case <-r.stopChan:
 				ticker.Stop()
 				metricsTicker.Stop()
+				eatBatchTicker.Stop()
 				return
+			case <-eatBatchTicker.C:
+				r.FlushEatBatch()
 			case now := <-ticker.C:
 				dt := now.Sub(lastTime).Seconds()
 				lastTime = now

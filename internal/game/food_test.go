@@ -101,3 +101,56 @@ func TestFoodExpirationAfterTTL(t *testing.T) {
 		t.Errorf("Expected ClaimAndEatFood to succeed after TTL expiration")
 	}
 }
+
+func TestEnqueueEatAndFlushBatch(t *testing.T) {
+	cfg := &config.Config{
+		WorldWidth:  5000,
+		WorldHeight: 5000,
+		TickRate:    30,
+	}
+
+	room := NewRoom("test-batch-room", cfg, func(state *WorldState) {})
+	p1 := room.AddPlayer("player_1", "Player1", 1)
+	p2 := room.AddPlayer("player_2", "Player2", 2)
+
+	foods := room.GetAllFoodsDTO()
+	if len(foods) < 5 {
+		t.Fatalf("Expected at least 5 foods")
+	}
+
+	var broadcastedBatches [][]FoodEatenEvent
+	room.SetEatBatchCallback(func(events []FoodEatenEvent) {
+		broadcastedBatches = append(broadcastedBatches, events)
+	})
+
+	// Multiple players eat multiple foods simultaneously via EnqueueEat
+	room.EnqueueEat(p1.ID, foods[0].ID, 10)
+	room.EnqueueEat(p2.ID, foods[1].ID, 15)
+	room.EnqueueEat(p1.ID, foods[2].ID, 5)
+
+	// Duplicate attempt: p2 tries to eat the same food as p1 (foods[0])
+	room.EnqueueEat(p2.ID, foods[0].ID, 10)
+
+	// Flush the batch atomically
+	events := room.FlushEatBatch()
+
+	if len(events) != 3 {
+		t.Fatalf("Expected exactly 3 accepted events, got %d", len(events))
+	}
+
+	if len(broadcastedBatches) != 1 {
+		t.Fatalf("Expected 1 batch broadcast, got %d", len(broadcastedBatches))
+	}
+
+	if len(broadcastedBatches[0]) != 3 {
+		t.Errorf("Expected batch of 3 items, got %d", len(broadcastedBatches[0]))
+	}
+
+	if p1.Snake.Score != 15 { // 10 + 5
+		t.Errorf("Expected p1 score 15, got %d", p1.Snake.Score)
+	}
+
+	if p2.Snake.Score != 15 { // 15
+		t.Errorf("Expected p2 score 15, got %d", p2.Snake.Score)
+	}
+}
