@@ -154,3 +154,52 @@ func TestEnqueueEatAndFlushBatch(t *testing.T) {
 		t.Errorf("Expected p2 score 15, got %d", p2.Snake.Score)
 	}
 }
+
+func TestDirectLocationStreamTriggersEat(t *testing.T) {
+	cfg := &config.Config{
+		WorldWidth:  5000,
+		WorldHeight: 5000,
+		TickRate:    30,
+	}
+
+	room := NewRoom("test-location-eat-room", cfg, func(state *WorldState) {})
+	player := room.AddPlayer("stream_player", "Streamer", 1)
+
+	allFoods := room.GetAllFoodsDTO()
+	if len(allFoods) == 0 {
+		t.Fatalf("Expected foods in room")
+	}
+
+	targetFood := allFoods[0]
+	initialScore := player.Snake.Score
+
+	var receivedEatenEvents []FoodEatenEvent
+	room.SetEatBatchCallback(func(events []FoodEatenEvent) {
+		receivedEatenEvents = append(receivedEatenEvents, events...)
+	})
+
+	// Client only streams snake location directly over the food coordinates
+	eaten := room.UpdatePlayerLocation(player.ID, targetFood.X, targetFood.Y, 0.0, false)
+
+	if len(eaten) == 0 {
+		t.Fatalf("Expected server to detect collision and eat food")
+	}
+
+	if eaten[0].FoodID != targetFood.ID {
+		t.Errorf("Expected FoodID %d, got %d", targetFood.ID, eaten[0].FoodID)
+	}
+
+	if player.Snake.Score <= initialScore {
+		t.Errorf("Expected snake score to increase, got %d, initial %d", player.Snake.Score, initialScore)
+	}
+
+	// Verify real-time callback was invoked
+	if len(receivedEatenEvents) == 0 {
+		t.Fatalf("Expected real-time eat callback to be triggered")
+	}
+
+	if receivedEatenEvents[0].FoodID != targetFood.ID {
+		t.Errorf("Expected callback FoodID %d, got %d", targetFood.ID, receivedEatenEvents[0].FoodID)
+	}
+}
+

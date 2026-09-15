@@ -130,3 +130,29 @@ func (s *Snake) Grow(amount int) {
 		s.Body = append(s.Body, newSeg)
 	}
 }
+
+// SetDirectLocation updates the snake head location directly from client authoritative stream
+func (s *Snake) SetDirectLocation(head physics.Vector2D, angle float64, isBoost bool) {
+	if !s.IsAlive {
+		return
+	}
+	s.Head = head
+	s.Angle = angle
+	s.TargetAngle = angle
+	s.IsBoosting = isBoost
+
+	prev := s.Head
+	for i := 0; i < len(s.Body); i++ {
+		seg := s.Body[i]
+		dist := physics.Distance(prev, seg)
+		if dist > SegmentSpacing {
+			ang := math.Atan2(prev.Y-seg.Y, prev.X-seg.X)
+			s.Body[i] = physics.Vector2D{
+				X: prev.X - math.Cos(ang)*SegmentSpacing,
+				Y: prev.Y - math.Sin(ang)*SegmentSpacing,
+			}
+		}
+		prev = s.Body[i]
+	}
+}
+

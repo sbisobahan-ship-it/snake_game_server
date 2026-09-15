@@ -41,7 +41,7 @@ func NewClient(id string, conn *websocket.Conn, onMessage func(c *Client, msgTyp
 	return &Client{
 		ID:        id,
 		Conn:      conn,
-		Send:      make(chan WSMessage, 512),
+		Send:      make(chan WSMessage, 1024),
 		done:      make(chan struct{}),
 		onMessage: onMessage,
 		onClose:   onClose,

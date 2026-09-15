@@ -37,13 +37,19 @@ func NewManager(room *game.Room) *Manager {
 		clients: make(map[string]*Client),
 	}
 
-	// Register high-speed binary block batch broadcast callback:
-	// Drains all eat events from 150+ players into a single binary block (0x06)
-	// and broadcasts directly to ALL connected clients (including the eater)!
+	// Register high-speed real-time eaten food broadcast callback:
+	// Broadcasts eaten food ID(s) to ALL connected clients in real-time
 	room.SetEatBatchCallback(func(events []game.FoodEatenEvent) {
+		if len(events) == 0 {
+			return
+		}
+		// 1. Binary broadcast (Opcode 0x06)
 		binData := EncodeEatBatchBinary(events)
 		m.BroadcastBinary(binData)
-		monitor.DefaultHub.Emit(monitor.ChanFood, "eat", "⚡ [BATCH EAT BROADCAST] Broadcast %d eaten food(s) to all %d connected players", len(events), m.GetActiveClientCount())
+
+		// JSON broadcast omitted for pure binary high-speed stream
+
+		monitor.DefaultHub.Emit(monitor.ChanFood, "eat", "⚡ [REAL-TIME EAT BROADCAST] Broadcast %d eaten food(s) to %d connected players", len(events), m.GetActiveClientCount())
 	})
 
 	return m
@@ -114,6 +120,11 @@ func (m *Manager) handleMessage(client *Client, msgType int, raw []byte) {
 		case BinOpPong: // 0x04: Binary Pong Keepalive
 			// Client acknowledged ping
 
+		case BinOpLocation: // 0x07: Direct authoritative client location stream
+			if x, y, angle, boost, ok := DecodeLocationBinary(raw); ok {
+				m.room.UpdatePlayerLocation(client.ID, x, y, angle, boost)
+			}
+
 		case BinOpEatBatch: // 0x06: Binary Eat Food Action (Ultra-fast non-blocking lock-free enqueue)
 			if items, ok := DecodeEatFoodBinary(raw); ok {
 				for _, item := range items {
@@ -148,6 +159,14 @@ func (m *Manager) handleMessage(client *Client, msgType int, raw []byte) {
 		if payloadBytes, err := json.Marshal(base.Payload); err == nil {
 			if json.Unmarshal(payloadBytes, &in) == nil {
 				m.room.UpdatePlayerInput(client.ID, in.TargetAngle, in.IsBoosting)
+			}
+		}
+
+	case OpLocation:
+		var loc LocationPayload
+		if payloadBytes, err := json.Marshal(base.Payload); err == nil {
+			if json.Unmarshal(payloadBytes, &loc) == nil {
+				m.room.UpdatePlayerLocation(client.ID, loc.X, loc.Y, loc.Angle, loc.IsBoosting)
 			}
 		}
 

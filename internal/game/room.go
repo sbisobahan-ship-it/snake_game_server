@@ -1,6 +1,8 @@
 package game
 
 import (
+	"log"
+	"math"
 	"math/rand"
 	"sync"
 	"sync/atomic"
@@ -68,6 +70,7 @@ type Room struct {
 	Config          *config.Config
 	Players         map[string]*Player
 	Foods           map[uint32]*Food
+	StaticFoods     *StaticFoodRegistry // 10k static food spatial dataset (30kx30k canvas)
 	consumedFoodIDs map[uint32]int64    // Fast lookup: foodID -> expireAt timestamp (ms)
 	consumedQueue   []consumedFoodEntry // Ordered FIFO queue for O(1) instant head eviction
 	pendingEaten    []FoodEatenEvent    // Batched eaten foods in the current tick window
@@ -98,7 +101,17 @@ func NewRoom(id string, cfg *config.Config, broadcastFn func(state *WorldState))
 		stopChan:        make(chan struct{}),
 	}
 
-	r.populateInitialFoods()
+	if cfg.StaticFoodCSVPath != "" {
+		staticFoods, err := NewStaticFoodRegistry(cfg.StaticFoodCSVPath, cfg.GridCellSize)
+		if err != nil {
+			log.Printf("⚠️ Warning: Could not load static foods CSV (%s): %v. Fallback to dynamic foods.", cfg.StaticFoodCSVPath, err)
+			r.populateInitialFoods()
+		} else {
+			r.StaticFoods = staticFoods
+		}
+	} else {
+		r.populateInitialFoods()
+	}
 
 	monitor.DefaultHub.Emit(monitor.ChanPhysics, "info", "Room '%s' initialized (World: %.0fx%.0f, Target TPS: %d)", id, cfg.WorldWidth, cfg.WorldHeight, cfg.TickRate)
 
@@ -158,19 +171,21 @@ func (r *Room) SpawnCustomFoods(count int) int {
 	return len(r.Foods)
 }
 
-// AddPlayer adds a new player with a random spawn location
+// AddPlayer adds a new player with a random spawn location inside canvas
 func (r *Room) AddPlayer(id, name string, skinID int) *Player {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	halfW := (r.Config.WorldWidth / 2.0) * 0.6
-	halfH := (r.Config.WorldHeight / 2.0) * 0.6
+	minX := 2000.0
+	maxX := math.Max(minX+1000.0, r.Config.WorldWidth-2000.0)
+	minY := 2000.0
+	maxY := math.Max(minY+1000.0, r.Config.WorldHeight-2000.0)
 
 	spawnPos := physics.Vector2D{
-		X: (rand.Float64()*2 - 1) * halfW,
-		Y: (rand.Float64()*2 - 1) * halfH,
+		X: minX + rand.Float64()*(maxX-minX),
+		Y: minY + rand.Float64()*(maxY-minY),
 	}
-	angle := rand.Float64() * 2 * 3.1415926535
+	angle := rand.Float64() * 2 * math.Pi
 
 	player := NewPlayer(id, name, spawnPos, angle, skinID)
 	r.Players[id] = player
@@ -200,6 +215,79 @@ func (r *Room) UpdatePlayerInput(playerID string, targetAngle float64, isBoostin
 		p.Snake.TargetAngle = targetAngle
 		p.Snake.IsBoosting = isBoosting
 	}
+}
+
+// checkCollisionsForPlayerLocked checks both static and dynamic food collisions for a specific snake head
+func (r *Room) checkCollisionsForPlayerLocked(p *Player) []FoodEatenEvent {
+	if p == nil || p.Snake == nil || !p.Snake.IsAlive {
+		return nil
+	}
+	s := p.Snake
+	var eatenList []FoodEatenEvent
+	now := time.Now().UnixMilli()
+
+	// 1. Static foods spatial collision (O(1) grid query on 30k canvas)
+	if r.StaticFoods != nil {
+		eatenEvents := r.StaticFoods.CheckCollisions(p.ID, s.Head.X, s.Head.Y, s.HeadRadius)
+		for _, ef := range eatenEvents {
+			s.Grow(ef.NewScore) // NewScore in ef originally holds Value gained
+			ef.NewScore = s.Score
+			r.pendingEaten = append(r.pendingEaten, ef)
+			atomic.AddUint64(&r.totalEaten, 1)
+			eatenList = append(eatenList, ef)
+
+			monitor.DefaultHub.Emit(monitor.ChanFood, "eat", "🍎 [SERVER COLLISION EAT] Player '%s' ate Static Food #%d at (%.0f, %.0f) -> New Score: %d", p.ID, ef.FoodID, s.Head.X, s.Head.Y, s.Score)
+		}
+	}
+
+	// 2. Dynamic foods collision check (if any exist)
+	for fid, food := range r.Foods {
+		if CheckFoodCollision(s.Head, s.HeadRadius, food) {
+			r.markFoodConsumedLocked(fid, now)
+
+			scoreGain := food.Value
+			if scoreGain <= 0 {
+				scoreGain = 1
+			}
+			s.Grow(scoreGain)
+
+			event := FoodEatenEvent{
+				FoodID:     food.ID,
+				ColorIndex: food.ColorIndex,
+				EaterID:    p.ID,
+				NewScore:   s.Score,
+			}
+			r.pendingEaten = append(r.pendingEaten, event)
+			eatenList = append(eatenList, event)
+
+			monitor.DefaultHub.Emit(monitor.ChanFood, "eat", "🍎 [SERVER COLLISION EAT] Player '%s' ate Food #%d at (%.0f, %.0f) -> New Score: %d", p.ID, food.ID, s.Head.X, s.Head.Y, s.Score)
+		}
+	}
+
+	return eatenList
+}
+
+// UpdatePlayerLocation updates client position directly from authoritative client stream (custom FPS)
+// and immediately evaluates food collision on the server, broadcasting eaten food numbers in real-time.
+func (r *Room) UpdatePlayerLocation(playerID string, x, y, angle float64, isBoosting bool) []FoodEatenEvent {
+	r.mu.Lock()
+	p, exists := r.Players[playerID]
+	if !exists || p.Snake == nil || !p.Snake.IsAlive {
+		r.mu.Unlock()
+		return nil
+	}
+
+	p.Snake.SetDirectLocation(physics.Vector2D{X: x, Y: y}, angle, isBoosting)
+	eatenEvents := r.checkCollisionsForPlayerLocked(p)
+	batchFn := r.onEatBatchFn
+	r.mu.Unlock()
+
+	// Immediately push eaten food numbers to all connected clients in real-time
+	if len(eatenEvents) > 0 && batchFn != nil {
+		batchFn(eatenEvents)
+	}
+
+	return eatenEvents
 }
 
 func (r *Room) markFoodConsumedLocked(foodID uint32, now int64) {
@@ -321,24 +409,43 @@ func (r *Room) flushEatBatchLocked(now int64) []FoodEatenEvent {
 }
 
 // ClaimAndEatFood authoritatively resolves race condition for a food item (First-Come, First-Served)
-// If multiple players send eat events for the same FoodID in the same millisecond/frame, only the first arrival gets it.
 func (r *Room) ClaimAndEatFood(playerID string, foodID uint32, scoreGain int) (accepted bool, newScore int) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
 	now := time.Now().UnixMilli()
 
-	// Check if already claimed/eaten (active within 8s TTL window)
-	if r.isFoodConsumedLocked(foodID, now) {
-		return false, 0
-	}
-
 	player, exists := r.Players[playerID]
 	if !exists || player.Snake == nil || !player.Snake.IsAlive {
 		return false, 0
 	}
 
-	// Mark food as consumed (adds to map and FIFO queue)
+	// 1. Try static food registry first
+	if r.StaticFoods != nil {
+		if sf, ok := r.StaticFoods.ClaimFood(foodID, playerID); ok {
+			gain := int(sf.Value)
+			if scoreGain > 0 {
+				gain = scoreGain
+			}
+			player.Snake.Grow(gain)
+			newScore = player.Snake.Score
+
+			r.pendingEaten = append(r.pendingEaten, FoodEatenEvent{
+				FoodID:     foodID,
+				ColorIndex: sf.FruitIndex,
+				EaterID:    playerID,
+				NewScore:   newScore,
+			})
+			atomic.AddUint64(&r.totalEaten, 1)
+			return true, newScore
+		}
+	}
+
+	// 2. Dynamic food lookup fallback
+	if r.isFoodConsumedLocked(foodID, now) {
+		return false, 0
+	}
+
 	r.markFoodConsumedLocked(foodID, now)
 
 	if scoreGain <= 0 {
@@ -348,7 +455,6 @@ func (r *Room) ClaimAndEatFood(playerID string, foodID uint32, scoreGain int) (a
 	player.Snake.Grow(scoreGain)
 	newScore = player.Snake.Score
 
-	// Add to frame batch
 	r.pendingEaten = append(r.pendingEaten, FoodEatenEvent{
 		FoodID:   foodID,
 		EaterID:  playerID,
@@ -360,17 +466,42 @@ func (r *Room) ClaimAndEatFood(playerID string, foodID uint32, scoreGain int) (a
 
 // EatFood removes food immediately and batches removal event for all clients
 func (r *Room) EatFood(playerID string, foodID uint32) (colorIndex uint8, scoreGained int, newScore int, ok bool) {
+	return r.ClaimAndEatFoodWithColor(playerID, foodID, 0)
+}
+
+// ClaimAndEatFoodWithColor resolves food claim and returns full color/score metadata
+func (r *Room) ClaimAndEatFoodWithColor(playerID string, foodID uint32, scoreGain int) (colorIndex uint8, scoreGained int, newScore int, ok bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
 	now := time.Now().UnixMilli()
 
-	if r.isFoodConsumedLocked(foodID, now) {
+	player, exists := r.Players[playerID]
+	if !exists || player.Snake == nil || !player.Snake.IsAlive {
 		return 0, 0, 0, false
 	}
 
-	player, exists := r.Players[playerID]
-	if !exists || player.Snake == nil || !player.Snake.IsAlive {
+	if r.StaticFoods != nil {
+		if sf, ok := r.StaticFoods.ClaimFood(foodID, playerID); ok {
+			gain := int(sf.Value)
+			if scoreGain > 0 {
+				gain = scoreGain
+			}
+			player.Snake.Grow(gain)
+			newScore = player.Snake.Score
+
+			r.pendingEaten = append(r.pendingEaten, FoodEatenEvent{
+				FoodID:     foodID,
+				ColorIndex: sf.FruitIndex,
+				EaterID:    playerID,
+				NewScore:   newScore,
+			})
+			atomic.AddUint64(&r.totalEaten, 1)
+			return sf.FruitIndex, gain, newScore, true
+		}
+	}
+
+	if r.isFoodConsumedLocked(foodID, now) {
 		return 0, 0, 0, false
 	}
 
@@ -407,6 +538,22 @@ func (r *Room) GetAllFoodsDTO() []FoodDTO {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 
+	if r.StaticFoods != nil {
+		staticList := r.StaticFoods.GetFoodsInViewport(0, 0, r.Config.WorldWidth, r.Config.WorldHeight)
+		list := make([]FoodDTO, 0, len(staticList))
+		for _, f := range staticList {
+			list = append(list, FoodDTO{
+				ID:         f.ID,
+				ColorIndex: f.FruitIndex,
+				X:          float64(f.X),
+				Y:          float64(f.Y),
+				Val:        int(f.Value),
+				Radius:     float64(f.Radius),
+			})
+		}
+		return list
+	}
+
 	list := make([]FoodDTO, 0, len(r.Foods))
 	for _, f := range r.Foods {
 		list = append(list, f.ToDTO())
@@ -426,54 +573,48 @@ func (r *Room) Tick(dt float64) {
 		}
 	}
 
-	// 2. Arena Boundary Clamping (Death disabled during food testing so snakes remain alive)
-	halfW := r.Config.WorldWidth / 2.0
-	halfH := r.Config.WorldHeight / 2.0
+	// 2. Arena Boundary Clamping [0, WorldWidth] x [0, WorldHeight]
+	worldW := r.Config.WorldWidth
+	worldH := r.Config.WorldHeight
 	for _, p := range r.Players {
 		s := p.Snake
 		if s == nil || !s.IsAlive {
 			continue
 		}
-		if s.Head.X < -halfW {
-			s.Head.X = -halfW
-		} else if s.Head.X > halfW {
-			s.Head.X = halfW
+		if s.Head.X < 0 {
+			s.Head.X = 0
+		} else if s.Head.X > worldW {
+			s.Head.X = worldW
 		}
-		if s.Head.Y < -halfH {
-			s.Head.Y = -halfH
-		} else if s.Head.Y > halfH {
-			s.Head.Y = halfH
+		if s.Head.Y < 0 {
+			s.Head.Y = 0
+		} else if s.Head.Y > worldH {
+			s.Head.Y = worldH
 		}
 	}
 
-	// 5. Server-side Proximity Food Eating (Collision check)
+	// 3. Static 10k Food Spatial Dataset Respawns
+	if r.StaticFoods != nil {
+		r.StaticFoods.TickRespawns(time.Now().UnixMilli())
+	}
+
+	// 4. Spatial Collision Detection for all moving snakes
+	var tickEatenEvents []FoodEatenEvent
 	for _, p := range r.Players {
-		s := p.Snake
-		if s == nil || !s.IsAlive {
-			continue
-		}
-
-		for fid, food := range r.Foods {
-			if CheckFoodCollision(s.Head, s.HeadRadius, food) {
-				r.markFoodConsumedLocked(fid, time.Now().UnixMilli())
-
-				scoreGain := food.Value
-				if scoreGain <= 0 {
-					scoreGain = 1
-				}
-				s.Grow(scoreGain)
-
-				r.pendingEaten = append(r.pendingEaten, FoodEatenEvent{
-					FoodID:     food.ID,
-					ColorIndex: food.ColorIndex,
-					EaterID:    p.ID,
-					NewScore:   s.Score,
-				})
+		if p.Snake != nil && p.Snake.IsAlive {
+			eaten := r.checkCollisionsForPlayerLocked(p)
+			if len(eaten) > 0 {
+				tickEatenEvents = append(tickEatenEvents, eaten...)
 			}
 		}
 	}
 
-	// 6. Assemble and Broadcast Unified Snapshot Block (Players + Eaten Batch + Spawned Batch)
+	// Immediate real-time broadcast of eaten foods to all clients
+	if len(tickEatenEvents) > 0 && r.onEatBatchFn != nil {
+		r.onEatBatchFn(tickEatenEvents)
+	}
+
+	// 5. Assemble and Broadcast Unified Snapshot Block (Players + Eaten Batch + Spawned Batch)
 	if r.broadcastFn != nil {
 		state := r.getWorldStateLocked()
 		r.broadcastFn(state)
@@ -483,7 +624,7 @@ func (r *Room) Tick(dt float64) {
 	r.pendingEaten = nil
 	r.pendingSpawned = nil
 
-	// 7. Instant O(1) FIFO Automatic Expiration (Pops expired items directly from the queue head)
+	// 6. Instant O(1) FIFO Automatic Expiration for dynamic foods
 	r.evictExpiredFoodsLocked(time.Now().UnixMilli())
 }
 

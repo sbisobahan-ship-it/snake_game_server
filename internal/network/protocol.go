@@ -1,4 +1,4 @@
-package network
+﻿package network
 
 import (
 	"bytes"
@@ -18,6 +18,7 @@ const (
 	OpChat       = "chat"
 	OpEatFood    = "eat_food"
 	OpFoodRelay  = "food"
+	OpLocation   = "location"
 )
 
 // Binary Opcode bytes
@@ -28,6 +29,7 @@ const (
 	BinOpPong       byte = 0x04
 	BinOpFoodRelay  byte = 0x05 // Pure Binary Food Data Relay
 	BinOpEatBatch   byte = 0x06 // Binary Eaten Food Action / Frame Batch Relay
+	BinOpLocation   byte = 0x07 // Direct authoritative client location stream
 )
 
 // ChatPayload represents real-time chat message broadcast
@@ -241,3 +243,29 @@ func DecodeInputBinary(data []byte) (angle float64, isBoost bool, ok bool) {
 	boost := (data[5] == 1)
 	return float64(angle32), boost, true
 }
+
+// LocationPayload represents direct client position stream at custom FPS
+type LocationPayload struct {
+	X          float64 `json:"x"`
+	Y          float64 `json:"y"`
+	Angle      float64 `json:"angle"`
+	IsBoosting bool    `json:"boost"`
+}
+
+// DecodeLocationBinary unpacks: [Opcode 0x07][X float32 4B][Y float32 4B][Angle float32 4B][Boost 1B]
+func DecodeLocationBinary(data []byte) (x, y, angle float64, isBoost bool, ok bool) {
+	if len(data) < 14 || data[0] != BinOpLocation {
+		return 0, 0, 0, false, false
+	}
+	xBits := binary.LittleEndian.Uint32(data[1:5])
+	yBits := binary.LittleEndian.Uint32(data[5:9])
+	angBits := binary.LittleEndian.Uint32(data[9:13])
+
+	x = float64(math.Float32frombits(xBits))
+	y = float64(math.Float32frombits(yBits))
+	angle = float64(math.Float32frombits(angBits))
+	isBoost = (data[13] == 1)
+	return x, y, angle, isBoost, true
+}
+
+

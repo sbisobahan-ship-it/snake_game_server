@@ -10,8 +10,10 @@ type Config struct {
 	Port         string
 	TickRate     int     // Server ticks per second (30 or 60 TPS)
 	WorldWidth   float64 // Arena width (e.g., 30000.0)
-	WorldHeight  float64 // Arena height (e.g., 30000.0)
-	MaxPlayers   int     // Max players per room
+	WorldHeight       float64 // Arena height (e.g., 30000.0)
+	MaxPlayers        int     // Max players per room
+	StaticFoodCSVPath string  // Path to 10k static foods CSV
+	GridCellSize      float64 // Spatial partition grid size (e.g. 300.0)
 }
 
 // Load loads configuration with environment variable fallbacks
@@ -19,18 +21,19 @@ func Load() *Config {
 	port := getEnv("PORT", "8080")
 	tickRate := getEnvAsInt("TICK_RATE", 30)
 	worldWidth := getEnvAsFloat("WORLD_WIDTH", 30000.0)
-	worldHeight := getEnvAsFloat("WORLD_HEIGHT", 300000.0)
-	if worldHeight > 30000.0 && worldWidth == 30000.0 {
-		worldHeight = 30000.0
-	}
+	worldHeight := getEnvAsFloat("WORLD_HEIGHT", 30000.0)
 	maxPlayers := getEnvAsInt("MAX_PLAYERS", 100)
+	staticFoodCSVPath := getEnv("STATIC_FOOD_CSV", "data/world_static_foods_10k.csv")
+	gridCellSize := getEnvAsFloat("GRID_CELL_SIZE", 300.0)
 
 	return &Config{
-		Port:        port,
-		TickRate:    tickRate,
-		WorldWidth:  worldWidth,
-		WorldHeight: worldHeight,
-		MaxPlayers:  maxPlayers,
+		Port:              port,
+		TickRate:          tickRate,
+		WorldWidth:        worldWidth,
+		WorldHeight:       worldHeight,
+		MaxPlayers:        maxPlayers,
+		StaticFoodCSVPath: staticFoodCSVPath,
+		GridCellSize:      gridCellSize,
 	}
 }
 
