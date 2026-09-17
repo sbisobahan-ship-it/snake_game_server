@@ -99,8 +99,22 @@ type Room struct {
 	mu              sync.RWMutex
 	broadcastFn     func(state *WorldState)
 	onEatBatchFn    func(events []FoodEatenEvent)
+	onPlayerDeadFn  func(playerID string, ds *DeadSession)
 	isRunning       bool
 	stopChan        chan struct{}
+}
+
+// DeadEvent represents an authoritative death event on the server
+type DeadEvent struct {
+	PlayerID string
+	Session  *DeadSession
+}
+
+// SetPlayerDeadCallback registers the callback invoked when a player dies authoritatively on the server
+func (r *Room) SetPlayerDeadCallback(fn func(playerID string, ds *DeadSession)) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.onPlayerDeadFn = fn
 }
 
 // NewRoom creates a new game room instance
@@ -138,13 +152,19 @@ func NewRoom(id string, cfg *config.Config, broadcastFn func(state *WorldState))
 }
 
 func (r *Room) populateInitialFoods() {
-	halfW := (r.Config.WorldWidth / 2.0) * 0.95
-	halfH := (r.Config.WorldHeight / 2.0) * 0.95
+	borderMargin := r.Config.BorderThickness
+	if borderMargin <= 0 {
+		borderMargin = 220.0
+	}
+	minX := borderMargin + 100.0
+	maxX := math.Max(minX, r.Config.WorldWidth-borderMargin-100.0)
+	minY := borderMargin + 100.0
+	maxY := math.Max(minY, r.Config.WorldHeight-borderMargin-100.0)
 
 	for i := 0; i < r.maxFoods; i++ {
 		pos := physics.Vector2D{
-			X: (rand.Float64()*2 - 1) * halfW,
-			Y: (rand.Float64()*2 - 1) * halfH,
+			X: minX + rand.Float64()*(maxX-minX),
+			Y: minY + rand.Float64()*(maxY-minY),
 		}
 		id := atomic.AddUint32(&r.foodSeq, 1)
 		val := rand.Intn(3) + 1
@@ -162,13 +182,19 @@ func (r *Room) SpawnCustomFoods(count int) int {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	halfW := (r.Config.WorldWidth / 2.0) * 0.95
-	halfH := (r.Config.WorldHeight / 2.0) * 0.95
+	borderMargin := r.Config.BorderThickness
+	if borderMargin <= 0 {
+		borderMargin = 220.0
+	}
+	minX := borderMargin + 100.0
+	maxX := math.Max(minX, r.Config.WorldWidth-borderMargin-100.0)
+	minY := borderMargin + 100.0
+	maxY := math.Max(minY, r.Config.WorldHeight-borderMargin-100.0)
 
 	for i := 0; i < count; i++ {
 		pos := physics.Vector2D{
-			X: (rand.Float64()*2 - 1) * halfW,
-			Y: (rand.Float64()*2 - 1) * halfH,
+			X: minX + rand.Float64()*(maxX-minX),
+			Y: minY + rand.Float64()*(maxY-minY),
 		}
 		id := atomic.AddUint32(&r.foodSeq, 1)
 		val := rand.Intn(3) + 1
@@ -234,10 +260,23 @@ func (r *Room) AddPlayerWithToken(id, token, name string, skinID int) *Player {
 	// Clean up any old dead session record for this token if starting fresh
 	delete(r.deadSessions, token)
 
-	minX := 2000.0
-	maxX := math.Max(minX+1000.0, r.Config.WorldWidth-2000.0)
-	minY := 2000.0
-	maxY := math.Max(minY+1000.0, r.Config.WorldHeight-2000.0)
+	borderMargin := r.Config.BorderThickness
+	if borderMargin <= 0 {
+		borderMargin = 220.0
+	}
+	safeMargin := borderMargin + 1000.0
+	if r.Config.WorldWidth <= (safeMargin * 2) {
+		safeMargin = borderMargin + 50.0
+	}
+	minX := safeMargin
+	maxX := math.Max(minX, r.Config.WorldWidth-safeMargin)
+
+	safeMarginH := borderMargin + 1000.0
+	if r.Config.WorldHeight <= (safeMarginH * 2) {
+		safeMarginH = borderMargin + 50.0
+	}
+	minY := safeMarginH
+	maxY := math.Max(minY, r.Config.WorldHeight-safeMarginH)
 
 	spawnPos := physics.Vector2D{
 		X: minX + rand.Float64()*(maxX-minX),
@@ -287,23 +326,18 @@ func (r *Room) MarkPlayerDisconnected(id string) {
 	}
 }
 
-// RecordPlayerDeath records terminal session details for dead snake and clears active token mapping
-func (r *Room) RecordPlayerDeath(playerID, reason string) *DeadSession {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-
-	p, exists := r.Players[playerID]
-	if !exists {
+// killPlayerLocked authoritatively kills a player, drops death food, stores dead session, and cleans up token mapping
+func (r *Room) killPlayerLocked(p *Player, reason string) *DeadSession {
+	if p == nil || p.Snake == nil || !p.Snake.IsAlive {
 		return nil
 	}
 
-	score := 0
-	if p.Snake != nil {
-		p.Snake.IsAlive = false
-		score = p.Snake.Score
-	}
+	p.Snake.IsAlive = false
+	score := p.Snake.Score
 	p.DeathReason = reason
 	p.DiedAt = time.Now().UnixMilli()
+
+	r.spawnDeathFoodsLocked(p.Snake, p.Name)
 
 	ds := &DeadSession{
 		Token:       p.Token,
@@ -318,7 +352,80 @@ func (r *Room) RecordPlayerDeath(playerID, reason string) *DeadSession {
 		delete(r.tokenToPlayer, p.Token)
 	}
 
+	monitor.DefaultHub.Emit(monitor.ChanPlayer, "warn", "💀 [AUTHORITATIVE DEATH] Player '%s' (Token: %s) died! Reason: %s | Final Score: %d", p.ID, p.Token, reason, score)
+
 	return ds
+}
+
+// checkFatalCollisionsForPlayerLocked evaluates boundary collision and snake-to-snake body/head collisions authoritatively
+func (r *Room) checkFatalCollisionsForPlayerLocked(p *Player) (*DeadSession, bool) {
+	if p == nil || p.Snake == nil || !p.Snake.IsAlive {
+		return nil, false
+	}
+	s := p.Snake
+
+	// 1. Boundary collision (breached [borderMargin, WorldWidth - borderMargin] x [borderMargin, WorldHeight - borderMargin])
+	borderMargin := r.Config.BorderThickness
+	if borderMargin <= 0 {
+		borderMargin = 220.0
+	}
+	if CheckBoundaryCollision(s.Head, s.HeadRadius, r.Config.WorldWidth, r.Config.WorldHeight, borderMargin) {
+		ds := r.killPlayerLocked(p, "boundary_collision")
+		return ds, true
+	}
+
+	// 2. Snake vs Snake Collisions (Body and Head collisions)
+	for _, other := range r.Players {
+		if other.ID == p.ID || other.Snake == nil || !other.Snake.IsAlive {
+			continue
+		}
+
+		// A. Head-to-Body Collision: Player p's head hits other snake's body segment
+		if CheckSnakeBodyCollision(s.Head, s.HeadRadius, other.Snake) {
+			targetName := other.Name
+			if targetName == "" {
+				targetName = other.ID
+			}
+			reason := fmt.Sprintf("collided_with_%s", targetName)
+			ds := r.killPlayerLocked(p, reason)
+			return ds, true
+		}
+
+		// B. Head-to-Head Collision
+		if CheckSnakeHeadCollision(s.Head, s.HeadRadius, other.Snake.Head, other.Snake.HeadRadius) {
+			targetName := other.Name
+			if targetName == "" {
+				targetName = other.ID
+			}
+			if s.Score < other.Snake.Score {
+				reason := fmt.Sprintf("head_collision_lost_to_%s", targetName)
+				ds := r.killPlayerLocked(p, reason)
+				return ds, true
+			} else if s.Score > other.Snake.Score {
+				reason := fmt.Sprintf("head_collision_lost_to_%s", p.Name)
+				r.killPlayerLocked(other, reason)
+			} else {
+				reason := fmt.Sprintf("head_to_head_tie_with_%s", targetName)
+				r.killPlayerLocked(other, reason)
+				ds := r.killPlayerLocked(p, reason)
+				return ds, true
+			}
+		}
+	}
+
+	return nil, false
+}
+
+// RecordPlayerDeath records terminal session details for dead snake and clears active token mapping
+func (r *Room) RecordPlayerDeath(playerID, reason string) *DeadSession {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	p, exists := r.Players[playerID]
+	if !exists {
+		return nil
+	}
+	return r.killPlayerLocked(p, reason)
 }
 
 // RemovePlayer cleans up player on explicit leave or defeat and registers dead session
@@ -410,7 +517,7 @@ func (r *Room) checkCollisionsForPlayerLocked(p *Player) []FoodEatenEvent {
 }
 
 // UpdatePlayerLocation updates client position directly from authoritative client stream (custom FPS)
-// and immediately evaluates food collision on the server, broadcasting eaten food numbers in real-time.
+// and immediately evaluates food collision and fatal collisions on the server, broadcasting events in real-time.
 func (r *Room) UpdatePlayerLocation(playerID string, x, y, angle float64, isBoosting bool) []FoodEatenEvent {
 	r.mu.Lock()
 	p, exists := r.Players[playerID]
@@ -421,12 +528,20 @@ func (r *Room) UpdatePlayerLocation(playerID string, x, y, angle float64, isBoos
 
 	p.Snake.SetDirectLocation(physics.Vector2D{X: x, Y: y}, angle, isBoosting)
 	eatenEvents := r.checkCollisionsForPlayerLocked(p)
+	ds, wasKilled := r.checkFatalCollisionsForPlayerLocked(p)
+
 	batchFn := r.onEatBatchFn
+	deadFn := r.onPlayerDeadFn
 	r.mu.Unlock()
 
 	// Immediately push eaten food numbers to all connected clients in real-time
 	if len(eatenEvents) > 0 && batchFn != nil {
 		batchFn(eatenEvents)
+	}
+
+	// Immediately notify death to client
+	if wasKilled && ds != nil && deadFn != nil {
+		deadFn(playerID, ds)
 	}
 
 	return eatenEvents
@@ -700,30 +815,23 @@ func (r *Room) Tick(dt float64) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	// 1. Update all snakes position
+	// 1. Update all living snakes position (dead reckoning simulation)
 	for _, p := range r.Players {
 		if p.Snake != nil && p.Snake.IsAlive {
 			p.Snake.UpdatePosition(dt)
 		}
 	}
 
-	// 2. Arena Boundary Clamping [0, WorldWidth] x [0, WorldHeight]
-	worldW := r.Config.WorldWidth
-	worldH := r.Config.WorldHeight
+	// 2. Fatal collision detection for all living snakes (boundary & snake body/head collisions)
+	var deadEvents []DeadEvent
 	for _, p := range r.Players {
-		s := p.Snake
-		if s == nil || !s.IsAlive {
-			continue
-		}
-		if s.Head.X < 0 {
-			s.Head.X = 0
-		} else if s.Head.X > worldW {
-			s.Head.X = worldW
-		}
-		if s.Head.Y < 0 {
-			s.Head.Y = 0
-		} else if s.Head.Y > worldH {
-			s.Head.Y = worldH
+		if p.Snake != nil && p.Snake.IsAlive {
+			if ds, wasKilled := r.checkFatalCollisionsForPlayerLocked(p); wasKilled && ds != nil {
+				deadEvents = append(deadEvents, DeadEvent{
+					PlayerID: p.ID,
+					Session:  ds,
+				})
+			}
 		}
 	}
 
@@ -732,7 +840,7 @@ func (r *Room) Tick(dt float64) {
 		r.StaticFoods.TickRespawns(time.Now().UnixMilli())
 	}
 
-	// 4. Spatial Collision Detection for all moving snakes
+	// 4. Spatial Collision Detection for all living snakes
 	var tickEatenEvents []FoodEatenEvent
 	for _, p := range r.Players {
 		if p.Snake != nil && p.Snake.IsAlive {
@@ -741,11 +849,6 @@ func (r *Room) Tick(dt float64) {
 				tickEatenEvents = append(tickEatenEvents, eaten...)
 			}
 		}
-	}
-
-	// Immediate real-time broadcast of eaten foods to all clients
-	if len(tickEatenEvents) > 0 && r.onEatBatchFn != nil {
-		r.onEatBatchFn(tickEatenEvents)
 	}
 
 	// 5. Assemble and Broadcast Unified Snapshot Block (Players + Eaten Batch + Spawned Batch)
@@ -760,6 +863,18 @@ func (r *Room) Tick(dt float64) {
 
 	// 6. Instant O(1) FIFO Automatic Expiration for dynamic foods
 	r.evictExpiredFoodsLocked(time.Now().UnixMilli())
+
+	// 7. Fire instant authoritative death callbacks to clients
+	if len(deadEvents) > 0 && r.onPlayerDeadFn != nil {
+		for _, de := range deadEvents {
+			r.onPlayerDeadFn(de.PlayerID, de.Session)
+		}
+	}
+
+	// 8. Immediate real-time broadcast of eaten foods to all clients
+	if len(tickEatenEvents) > 0 && r.onEatBatchFn != nil {
+		r.onEatBatchFn(tickEatenEvents)
+	}
 }
 
 func (r *Room) spawnDeathFoodsLocked(snake *Snake, playerName string) {

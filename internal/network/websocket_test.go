@@ -1,6 +1,8 @@
 package network
 
 import (
+	"encoding/binary"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -365,4 +367,182 @@ func TestConcurrentSocketReconnectDeadlockPrevention(t *testing.T) {
 		tempConn.Close()
 	}
 }
+
+func TestAuthoritativeDeathNotification(t *testing.T) {
+	cfg := &config.Config{
+		WorldWidth:  2000,
+		WorldHeight: 2000,
+		TickRate:    30,
+	}
+	room := game.NewRoom("test-room-death-notify", cfg, nil)
+	netMgr := NewManager(room)
+
+	server := httptest.NewServer(http.HandlerFunc(netMgr.HandleWS))
+	defer server.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(server.URL, "http")
+
+	// 1. Connect Client
+	conn, _, err := websocket.DefaultDialer.Dial(wsURL+"?id=death_test_p1", nil)
+	if err != nil {
+		t.Fatalf("Failed to dial WebSocket: %v", err)
+	}
+	defer conn.Close()
+
+	var welcome BaseMessage
+	conn.ReadJSON(&welcome)
+
+	// 2. Start Game
+	conn.WriteJSON(map[string]interface{}{
+		"type": "start",
+		"payload": map[string]interface{}{
+			"start": true,
+			"name":  "DeathTester",
+		},
+	})
+
+	var startedResp BaseMessage
+	conn.ReadJSON(&startedResp)
+
+	// 3. Move snake outside boundary via UpdatePlayerLocation to trigger authoritative death
+	room.UpdatePlayerLocation("death_test_p1", 2500, 2500, 0, false)
+
+	// 4. Verify client receives instant game_over packet
+	conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	receivedGameOver := false
+	var finalNotice struct {
+		Type    string                 `json:"type"`
+		Payload map[string]interface{} `json:"payload"`
+	}
+
+	for i := 0; i < 10; i++ {
+		msgType, data, err := conn.ReadMessage()
+		if err != nil {
+			break
+		}
+		if msgType == websocket.TextMessage {
+			var msg struct {
+				Type    string                 `json:"type"`
+				Payload map[string]interface{} `json:"payload"`
+			}
+			if err := json.Unmarshal(data, &msg); err == nil {
+				if msg.Type == "game_over" || msg.Type == "player_die" {
+					receivedGameOver = true
+					finalNotice = msg
+					break
+				}
+			}
+		}
+	}
+
+	if !receivedGameOver {
+		t.Fatalf("Expected to receive 'game_over' or 'player_die' notification")
+	}
+
+	if finalNotice.Payload["status"] != "dead" {
+		t.Errorf("Expected status 'dead', got %v", finalNotice.Payload["status"])
+	}
+	if finalNotice.Payload["reason"] != "boundary_collision" {
+		t.Errorf("Expected reason 'boundary_collision', got %v", finalNotice.Payload["reason"])
+	}
+}
+
+func TestBinaryPingPongEchoAndRateLimit(t *testing.T) {
+	cfg := &config.Config{
+		WorldWidth:  5000,
+		WorldHeight: 5000,
+		TickRate:    30,
+	}
+	room := game.NewRoom("test-room-ping", cfg, nil)
+	netMgr := NewManager(room)
+
+	server := httptest.NewServer(http.HandlerFunc(netMgr.HandleWS))
+	defer server.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(server.URL, "http")
+	conn, _, err := websocket.DefaultDialer.Dial(wsURL+"?id=ping_player", nil)
+	if err != nil {
+		t.Fatalf("Failed to dial WebSocket: %v", err)
+	}
+	defer conn.Close()
+
+	// Drain welcome message
+	var welcomeMsg BaseMessage
+	_ = conn.ReadJSON(&welcomeMsg)
+
+	// Start client reader goroutine to receive binary pong responses
+	pongChan := make(chan []byte, 10)
+	go func() {
+		for {
+			msgType, data, err := conn.ReadMessage()
+			if err != nil {
+				return
+			}
+			if msgType == websocket.BinaryMessage && len(data) == 9 && data[0] == OP_PONG {
+				pongChan <- data
+			}
+		}
+	}()
+
+	// 1. Send Ping 1 (9 Bytes: [0x08][8B Little-Endian timestamp])
+	testTimestamp := int64(1740001234567)
+	pingPacket := make([]byte, 9)
+	pingPacket[0] = OP_PING
+	binary.LittleEndian.PutUint64(pingPacket[1:9], uint64(testTimestamp))
+
+	if err := conn.WriteMessage(websocket.BinaryMessage, pingPacket); err != nil {
+		t.Fatalf("Failed to send binary ping 1: %v", err)
+	}
+
+	// Expect Pong 1
+	select {
+	case pongData := <-pongChan:
+		echoedTs := int64(binary.LittleEndian.Uint64(pongData[1:9]))
+		if echoedTs != testTimestamp {
+			t.Errorf("Expected echoed timestamp %d, got %d", testTimestamp, echoedTs)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatalf("Timeout waiting for pong response 1")
+	}
+
+	// 2. Test Rate Limiting: Send rapid second ping immediately (< 500ms)
+	pingPacket2 := make([]byte, 9)
+	pingPacket2[0] = OP_PING
+	binary.LittleEndian.PutUint64(pingPacket2[1:9], uint64(testTimestamp+50))
+
+	if err := conn.WriteMessage(websocket.BinaryMessage, pingPacket2); err != nil {
+		t.Fatalf("Failed to send rapid ping: %v", err)
+	}
+
+	// Should NOT receive any response on pongChan
+	select {
+	case unexpected := <-pongChan:
+		t.Fatalf("Expected rapid ping to be rate-limited, but received response: %v", unexpected)
+	case <-time.After(150 * time.Millisecond):
+		// Expected to be dropped by rate limiter
+	}
+
+	// 3. Wait > 500ms and send third ping
+	time.Sleep(550 * time.Millisecond)
+	pingPacket3 := make([]byte, 9)
+	pingPacket3[0] = OP_PING
+	binary.LittleEndian.PutUint64(pingPacket3[1:9], uint64(testTimestamp+600))
+
+	if err := conn.WriteMessage(websocket.BinaryMessage, pingPacket3); err != nil {
+		t.Fatalf("Failed to send delayed ping: %v", err)
+	}
+
+	// Expect Pong 3
+	select {
+	case pongData3 := <-pongChan:
+		echoedTs3 := int64(binary.LittleEndian.Uint64(pongData3[1:9]))
+		if echoedTs3 != testTimestamp+600 {
+			t.Errorf("Expected echoed timestamp %d, got %d", testTimestamp+600, echoedTs3)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatalf("Timeout waiting for pong response 3 after 500ms window")
+	}
+}
+
+
 

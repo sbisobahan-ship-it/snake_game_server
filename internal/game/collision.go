@@ -4,14 +4,11 @@ import (
 	"snake_game_server/internal/physics"
 )
 
-// CheckBoundaryCollision checks if snake head has breached the arena boundary
-func CheckBoundaryCollision(head physics.Vector2D, radius float64, worldWidth, worldHeight float64) bool {
-	halfW := worldWidth / 2.0
-	halfH := worldHeight / 2.0
-
-	// Arena centered at (0,0) or (halfW, halfH). Using (0,0) centered bounds [-halfW, halfW]
-	if head.X-radius < -halfW || head.X+radius > halfW ||
-		head.Y-radius < -halfH || head.Y+radius > halfH {
+// CheckBoundaryCollision checks if snake head touches or crosses the arena border margin (e.g. 220.0 brick thickness).
+// Playable area: (X: borderMargin to worldWidth - borderMargin, Y: borderMargin to worldHeight - borderMargin)
+func CheckBoundaryCollision(head physics.Vector2D, radius float64, worldWidth, worldHeight float64, borderMargin float64) bool {
+	if head.X-radius <= borderMargin || head.X+radius >= (worldWidth-borderMargin) ||
+		head.Y-radius <= borderMargin || head.Y+radius >= (worldHeight-borderMargin) {
 		return true
 	}
 	return false
@@ -25,7 +22,7 @@ func CheckFoodCollision(head physics.Vector2D, headRadius float64, food *Food) b
 
 // CheckSnakeBodyCollision checks if the attacking snake's head hits any body segment of target snake
 func CheckSnakeBodyCollision(head physics.Vector2D, headRadius float64, target *Snake) bool {
-	if !target.IsAlive {
+	if target == nil || !target.IsAlive {
 		return false
 	}
 
@@ -38,4 +35,10 @@ func CheckSnakeBodyCollision(head physics.Vector2D, headRadius float64, target *
 		}
 	}
 	return false
+}
+
+// CheckSnakeHeadCollision checks if two snake heads collide
+func CheckSnakeHeadCollision(head1 physics.Vector2D, r1 float64, head2 physics.Vector2D, r2 float64) bool {
+	combinedRadius := r1 + r2
+	return physics.DistanceSquared(head1, head2) <= (combinedRadius * combinedRadius)
 }

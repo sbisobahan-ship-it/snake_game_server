@@ -52,7 +52,43 @@ func NewManager(room *game.Room) *Manager {
 		monitor.DefaultHub.Emit(monitor.ChanFood, "eat", "⚡ [REAL-TIME EAT BROADCAST] Broadcast %d eaten food(s) to %d connected players", len(events), m.GetActiveClientCount())
 	})
 
+	// Register authoritative player death notification callback:
+	// Instantly informs client that its snake has died and broadcasts death to other clients
+	room.SetPlayerDeadCallback(func(playerID string, ds *game.DeadSession) {
+		m.mu.RLock()
+		client, exists := m.clients[playerID]
+		m.mu.RUnlock()
+
+		deadPayload := GameOverPayload{
+			ID:         ds.PlayerID,
+			Token:      ds.Token,
+			Status:     "dead",
+			Reason:     ds.DeathReason,
+			FinalScore: ds.FinalScore,
+			DiedAt:     ds.DiedAt,
+		}
+
+		// 1. Send instant JSON notification to the dying client
+		if exists && client != nil {
+			client.SendJSON(map[string]interface{}{
+				"type":    OpGameOver,
+				"payload": deadPayload,
+			})
+			client.SendJSON(map[string]interface{}{
+				"type":    OpPlayerDie,
+				"payload": deadPayload,
+			})
+		}
+
+		// 2. Broadcast player death notice to all other connected clients
+		m.BroadcastJSONExcept(playerID, "player_died", deadPayload)
+
+		log.Printf("💀 [SERVER AUTHORITATIVE DEATH] Client '%s' died (Reason: %s | Score: %d) -> Sent game_over notice", playerID, ds.DeathReason, ds.FinalScore)
+		monitor.DefaultHub.Emit(monitor.ChanPlayer, "warn", "💀 [DEATH NOTICE SENT] Client '%s' died (%s) | Final Score: %d", playerID, ds.DeathReason, ds.FinalScore)
+	})
+
 	m.StartStoreSyncTicker()
+	m.StartReaperTicker()
 
 	return m
 }
@@ -224,16 +260,23 @@ func (m *Manager) handleMessage(client *Client, msgType int, raw []byte) {
 			m.BroadcastBinaryExcept(client.ID, raw)
 			monitor.DefaultHub.Emit(monitor.ChanFood, "spawn", "🍎 [BINARY FOOD RELAY] Broadcast %d bytes food payload from '%s'", len(raw), client.ID)
 
-		case BinOpPing: // 0x03: Binary Ping Keepalive
-			client.SendBinary([]byte{BinOpPong})
+		case BinOpPingLegacy: // 0x03: Legacy Binary Ping Keepalive
+			client.SendBinary([]byte{BinOpPongLegacy})
 			if pSync, ok := m.room.GetPlayerSync(client.ID); ok {
 				client.SendBinary(EncodeLocationSyncBinary(pSync))
 			}
 
-		case BinOpPong: // 0x04: Binary Pong Keepalive
+		case BinOpPongLegacy: // 0x04: Legacy Binary Pong Keepalive
 			// Client acknowledged ping
 
-		case BinOpLocationSync: // 0x08: Client requests authoritative server location sync
+		case BinOpPing: // 0x08: Ultra-fast Zero-Alloc Binary Ping (Fallback if dispatched here)
+			now := time.Now().UnixMilli()
+			last := client.LastActive()
+			if now-last >= 500 && len(raw) >= 9 {
+				client.SendBinary(raw[:9])
+			}
+
+		case BinOpLocationSync: // 0x09: Client requests authoritative server location sync
 			if pSync, ok := m.room.GetPlayerSync(client.ID); ok {
 				client.SendBinary(EncodeLocationSyncBinary(pSync))
 			}
@@ -691,3 +734,34 @@ func (m *Manager) broadcastStoreSync() {
 		}
 	}
 }
+
+// StartReaperTicker starts the background dead connection reaper (5s inactivity timeout)
+func (m *Manager) StartReaperTicker() {
+	ticker := time.NewTicker(1 * time.Second)
+	go func() {
+		for range ticker.C {
+			m.reapInactiveClients()
+		}
+	}()
+}
+
+// reapInactiveClients closes dead connections that haven't sent any packet/ping for > 15 seconds
+func (m *Manager) reapInactiveClients() {
+	m.mu.RLock()
+	now := time.Now().UnixMilli()
+	var deadClients []*Client
+	for _, client := range m.clients {
+		lastActive := client.LastActive()
+		if lastActive > 0 && (now-lastActive) > 15000 {
+			deadClients = append(deadClients, client)
+		}
+	}
+	m.mu.RUnlock()
+
+	for _, client := range deadClients {
+		log.Printf("⏱️ [Heartbeat Timeout Reaper] Client '%s' inactive for >15s -> Disconnecting", client.ID)
+		monitor.DefaultHub.Emit(monitor.ChanNetwork, "warn", "⏱️ [REAPER TIMEOUT] Client '%s' inactive for >15s -> Disconnected", client.ID)
+		client.Close()
+	}
+}
+

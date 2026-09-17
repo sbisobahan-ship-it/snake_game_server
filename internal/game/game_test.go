@@ -1,6 +1,9 @@
 package game
 
 import (
+	"fmt"
+	"math"
+	"strings"
 	"testing"
 
 	"snake_game_server/internal/config"
@@ -43,23 +46,61 @@ func TestCollisionDetection(t *testing.T) {
 	}
 	room := NewRoom("test-room", cfg, nil)
 
+	var deadNotifiedID string
+	var deadReason string
+	room.SetPlayerDeadCallback(func(playerID string, ds *DeadSession) {
+		deadNotifiedID = playerID
+		deadReason = ds.DeathReason
+	})
+
 	p1 := room.AddPlayer("p1", "Player One", 1)
 	if p1 == nil || !p1.Snake.IsAlive {
 		t.Fatalf("Player 1 failed to spawn")
 	}
 
-	// Test boundary clamping by forcing position outside bounds [0, 1000]
+	// 1. Test boundary collision death by forcing position outside bounds [0, 1000]
 	p1.Snake.Head = physics.Vector2D{X: 1200, Y: -50}
 	room.Tick(0.033)
 
-	if p1.Snake.Head.X > 1000 {
-		t.Errorf("Expected snake head to be clamped to <= 1000, got %f", p1.Snake.Head.X)
+	if p1.Snake.IsAlive {
+		t.Errorf("Expected snake to be dead after breaching arena boundary")
 	}
-	if p1.Snake.Head.Y < 0 {
-		t.Errorf("Expected snake head to be clamped to >= 0, got %f", p1.Snake.Head.Y)
+	if deadNotifiedID != "p1" {
+		t.Errorf("Expected dead callback for p1, got %s", deadNotifiedID)
 	}
-	if !p1.Snake.IsAlive {
-		t.Errorf("Expected snake to remain alive with boundary clamping")
+	if deadReason != "boundary_collision" {
+		t.Errorf("Expected death reason 'boundary_collision', got %s", deadReason)
+	}
+
+	// 2. Test snake vs snake body collision
+	deadNotifiedID = ""
+	deadReason = ""
+
+	p2 := room.AddPlayer("p2", "Player Two", 1)
+	p3 := room.AddPlayer("p3", "Player Three", 1)
+
+	// Position p2 at (500, 500) and establish body segments
+	p2.Snake.Head = physics.Vector2D{X: 500, Y: 500}
+	p2.Snake.Body = []physics.Vector2D{
+		{X: 488, Y: 500},
+		{X: 476, Y: 500},
+		{X: 464, Y: 500},
+	}
+
+	// Move p3's head directly into p2's body segment at (476, 500) via UpdatePlayerLocation stream
+	room.UpdatePlayerLocation("p3", 476, 500, 0, false)
+
+	if p3.Snake.IsAlive {
+		t.Errorf("Expected p3 to die upon colliding with p2's body")
+	}
+	if !p2.Snake.IsAlive {
+		t.Errorf("Expected p2 to remain alive when another snake hits its body")
+	}
+	if deadNotifiedID != "p3" {
+		t.Errorf("Expected dead callback for p3, got %s", deadNotifiedID)
+	}
+	if !strings.HasPrefix(deadReason, "collided_with_") {
+		t.Errorf("Expected death reason to start with 'collided_with_', got %s", deadReason)
 	}
 }
 
@@ -208,6 +249,83 @@ func TestStaticFoodScoringAndGrowth(t *testing.T) {
 		t.Errorf("Expected %d segments after 12 foods, got %d", InitialSegments+2, len(snake.Body))
 	}
 }
+
+func TestWorldBorderCollisionAndDeath(t *testing.T) {
+	cfg := &config.Config{
+		WorldWidth:      30000.0,
+		WorldHeight:     30000.0,
+		BorderThickness: 220.0,
+		TickRate:        30,
+	}
+	room := NewRoom("test-border-room", cfg, nil)
+
+	var deadNotifiedID string
+	var deadReason string
+	room.SetPlayerDeadCallback(func(playerID string, ds *DeadSession) {
+		deadNotifiedID = playerID
+		deadReason = ds.DeathReason
+	})
+
+	// 1. Snake safely inside playable area (X: 15000, Y: 15000)
+	pSafe := room.AddPlayer("p_safe", "SafePlayer", 1)
+	pSafe.Snake.Head = physics.Vector2D{X: 15000.0, Y: 15000.0}
+	room.Tick(0.033)
+	if !pSafe.Snake.IsAlive {
+		t.Errorf("Expected snake at center to be alive")
+	}
+
+	// 2. Left border collision: headX - radius <= 220.0 (e.g. HeadX = 220.0, HeadRadius = 14.0 -> headX - radius = 206.0 <= 220.0)
+	pLeft := room.AddPlayer("p_left", "LeftPlayer", 1)
+	pLeft.Snake.Head = physics.Vector2D{X: 220.0, Y: 15000.0}
+	pLeft.Snake.Angle = math.Pi // Moving West into the border
+	room.Tick(0.033)
+	if pLeft.Snake.IsAlive {
+		t.Errorf("Expected left border collision to kill snake (headX - radius <= 220.0)")
+	}
+	if deadNotifiedID != "p_left" {
+		t.Errorf("Expected dead notification for p_left, got %s", deadNotifiedID)
+	}
+	if deadReason != "boundary_collision" {
+		t.Errorf("Expected dead reason 'boundary_collision', got %s", deadReason)
+	}
+
+	// 3. Right border collision: headX + radius >= 29780.0 (30000 - 220) (e.g. HeadX = 29780.0, HeadRadius = 14.0)
+	pRight := room.AddPlayer("p_right", "RightPlayer", 1)
+	pRight.Snake.Head = physics.Vector2D{X: 29780.0, Y: 15000.0}
+	pRight.Snake.Angle = 0.0 // Moving East into the border
+	room.Tick(0.033)
+	if pRight.Snake.IsAlive {
+		t.Errorf("Expected right border collision to kill snake (headX + radius >= 29780.0)")
+	}
+
+	// 4. Top border collision: headY - radius <= 220.0
+	pTop := room.AddPlayer("p_top", "TopPlayer", 1)
+	pTop.Snake.Head = physics.Vector2D{X: 15000.0, Y: 220.0}
+	pTop.Snake.Angle = 3 * math.Pi / 2 // Moving North into the border
+	room.Tick(0.033)
+	if pTop.Snake.IsAlive {
+		t.Errorf("Expected top border collision to kill snake (headY - radius <= 220.0)")
+	}
+
+	// 5. Bottom border collision: headY + radius >= 29780.0
+	pBottom := room.AddPlayer("p_bottom", "BottomPlayer", 1)
+	pBottom.Snake.Head = physics.Vector2D{X: 15000.0, Y: 29780.0}
+	pBottom.Snake.Angle = math.Pi / 2 // Moving South into the border
+	room.Tick(0.033)
+	if pBottom.Snake.IsAlive {
+		t.Errorf("Expected bottom border collision to kill snake (headY + radius >= 29780.0)")
+	}
+
+	// 6. Test spawn safety: newly spawned snakes must be inside [220.0, 29780.0]
+	for i := 0; i < 20; i++ {
+		pSpawn := room.AddPlayer(fmt.Sprintf("spawn_%d", i), "Spawnee", 1)
+		if pSpawn.Snake.Head.X < 220.0 || pSpawn.Snake.Head.X > 29780.0 ||
+			pSpawn.Snake.Head.Y < 220.0 || pSpawn.Snake.Head.Y > 29780.0 {
+			t.Errorf("Spawn position outside playable border: (%f, %f)", pSpawn.Snake.Head.X, pSpawn.Snake.Head.Y)
+		}
+	}
+}
+
 
 
 

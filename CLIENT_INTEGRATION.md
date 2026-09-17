@@ -19,7 +19,28 @@ This document contains the complete server endpoints, connection URLs, binary ne
 
 ---
 
-## 🔑 2. Token-Based Session Management & Reconnection
+## 🧱 2. World Dimensions & Border Collision Specifications
+
+| Metric / Parameter | Value | Description |
+| :--- | :--- | :--- |
+| **World Width** | `30000.0` | Total arena width |
+| **World Height** | `30000.0` | Total arena height |
+| **Border Thickness (Brick Margin)** | `220.0` | Outer brick border surrounding the arena |
+| **Playable X Range** | `220.0` to `29780.0` | Safe playable horizontal coordinate range (`30000.0 - 220.0`) |
+| **Playable Y Range** | `220.0` to `29780.0` | Safe playable vertical coordinate range (`30000.0 - 220.0`) |
+
+### 💥 Border Collision Death Condition:
+The server checks in each tick and direct location stream:
+- `headX - headRadius <= 220.0`
+- `headY - headRadius <= 220.0`
+- `headX + headRadius >= 29780.0`
+- `headY + headRadius >= 29780.0`
+
+When touching or crossing this border, the snake **instantly dies**, bursts into food, and the server pushes `{"type": "game_over", "payload": {"status": "dead", "reason": "boundary_collision", ...}}`.
+
+---
+
+## 🔑 3. Token-Based Session Management & Reconnection
 
 ### 1. Game Start & Token Issuance
 When the client starts a match, the server generates a unique 32-character session `token` and returns it in `started` and `joined` packets.
@@ -194,11 +215,23 @@ When the player dies or leaves, client can send:
   - `[Bytes 1..4]` : `Float32` (Angle in Radians, Little-Endian)
   - `[Byte 5]` : `Uint8` (`1` = Boost Active, `0` = Normal)
 
-#### 4. Location Sync Request (Lag Recovery / Dead Reckoning Sync)
+#### 4. Ultra-Fast Binary Ping / Pong (RTT Measurement - 9 Bytes Total)
+To accurately display network Ping (ms) in real-time with zero server allocation:
+* **Client -> Server Ping Packet (9 Bytes):**
+  - `[Byte 0]` : `0x08` (Opcode: `OP_PING`)
+  - `[Bytes 1..8]` : `Int64` (Client Timestamp `t` in milliseconds, Little-Endian)
+* **Server -> Client Pong Packet (9 Bytes - Direct Echo):**
+  - `[Byte 0]` : `0x08` (Opcode: `OP_PONG`)
+  - `[Bytes 1..8]` : `Int64` (Echoed Client Timestamp `t`, Little-Endian)
+* **Client Ping Calculation:** `RTT = System.currentTimeMillis() - echoedTimestamp`.
+* **Rate Limiting:** Server rate-limits ping echoes to 1 response per 500ms (max 2 pings/sec per client).
+* **Heartbeat & Timeout:** Keeps connection alive. Inactive connections (> 5s without any packet/ping) are automatically cleaned up.
+
+#### 5. Location Sync Request (Lag Recovery / Dead Reckoning Sync)
 When a client experiences network lag or disconnects temporarily:
 - The **Server is 100% Authoritative**: In the server's 30 TPS simulation loop, the snake continues moving forward along its last known angle/speed (Dead Reckoning). Any foods eaten or boundary collisions during this time are authoritatively resolved on the server.
-- When connection resumes, client requests sync via JSON `{"type": "sync"}` or Binary `[0x08]` (or in Ping response).
-- **Server Response (`location_sync` / Binary `0x08`):**
+- When connection resumes, client requests sync via JSON `{"type": "sync"}` or Binary `[0x09]` (or in Ping response).
+- **Server Response (`location_sync` / Binary `0x09`):**
 ```json
 {
   "type": "location_sync",
@@ -215,8 +248,8 @@ When a client experiences network lag or disconnects temporarily:
   }
 }
 ```
-* **Binary Response Format (`0x08`):**
-  - `[Byte 0]` : `0x08` (`BinOpLocationSync`)
+* **Binary Response Format (`0x09`):**
+  - `[Byte 0]` : `0x09` (`BinOpLocationSync`)
   - `[Bytes 1..4]` : `Float32` (Authoritative Head X)
   - `[Bytes 5..8]` : `Float32` (Authoritative Head Y)
   - `[Bytes 9..12]` : `Float32` (Authoritative Angle)
@@ -258,7 +291,45 @@ Handles 150+ concurrent players with instant 0-latency.
   1. Remove `food_id` / Food Number from local canvas/map rendering.
   2. Update `eater_id`'s snake score and target length on screen.
 
-#### 2. Unified 30 FPS WorldState Frame (Binary: `Opcode 0x01`)
+#### 2. Server-Authoritative Instant Death Notification (`game_over` / `player_die`)
+When a snake dies on the server due to **Boundary Collision** or **Snake-to-Snake Body/Head Collision**, the server **immediately pushes a JSON death notice to the client**:
+
+* **Packet received by dying client:**
+```json
+{
+  "type": "game_over",
+  "payload": {
+    "id": "p_1",
+    "token": "tok_9f82d1c4b7204e19a4b3d76e28f1025a",
+    "status": "dead",
+    "reason": "boundary_collision",
+    "final_score": 140,
+    "died_at": 1740000012000
+  }
+}
+```
+*(Also sent with `"type": "player_die"` for backwards compatibility)*
+
+* **Broadcast to all other clients:**
+```json
+{
+  "type": "player_died",
+  "payload": {
+    "id": "p_1",
+    "status": "dead",
+    "reason": "collided_with_PlayerTwo",
+    "final_score": 140,
+    "died_at": 1740000012000
+  }
+}
+```
+
+* **Client Action upon receiving `game_over`:**
+  1. Trigger local game over / death animation.
+  2. Display final score and Death Reason.
+  3. Show Play Again / Respawn button (client can send `{"type": "start", "payload": {"start": true}}` on the same connection).
+
+#### 3. Unified 30 FPS WorldState Frame (Binary: `Opcode 0x01`)
 Broadcast to all clients every ~33ms (30 TPS).
 
 * **Header:**

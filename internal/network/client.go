@@ -5,6 +5,7 @@ import (
 	"log"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -25,21 +26,25 @@ type WSMessage struct {
 
 // Client represents a single active WebSocket connection
 type Client struct {
-	ID        string
-	Name      string
-	Conn      *websocket.Conn
-	Send      chan WSMessage
-	done      chan struct{} // Closed when client disconnects to instantly terminate WritePump
-	onMessage func(c *Client, msgType int, raw []byte)
-	onClose   func(c *Client)
-	mu        sync.Mutex
-	writeMu   sync.Mutex // Serializes all writes (WriteMessage and WriteControl) to avoid concurrent write collisions
-	isClosed  bool
+	ID             string
+	Name           string
+	Conn           *websocket.Conn
+	Send           chan WSMessage
+	done           chan struct{} // Closed when client disconnects to instantly terminate WritePump
+	onMessage      func(c *Client, msgType int, raw []byte)
+	onClose        func(c *Client)
+	mu             sync.Mutex
+	writeMu        sync.Mutex // Serializes all writes (WriteMessage and WriteControl) to avoid concurrent write collisions
+	isClosed       bool
+	lastActiveUnix sync.Mutex // unused directly; atomic int64 below is used
+	lastActiveNano int64      // Handled via atomic
+	lastActiveMs   int64      // Handled via atomic
+	lastPingMs     int64      // Handled via atomic
 }
 
 // NewClient creates a new client connection wrapper
 func NewClient(id string, conn *websocket.Conn, onMessage func(c *Client, msgType int, raw []byte), onClose func(c *Client)) *Client {
-	return &Client{
+	c := &Client{
 		ID:        id,
 		Conn:      conn,
 		Send:      make(chan WSMessage, 1024),
@@ -47,6 +52,18 @@ func NewClient(id string, conn *websocket.Conn, onMessage func(c *Client, msgTyp
 		onMessage: onMessage,
 		onClose:   onClose,
 	}
+	c.UpdateActivity()
+	return c
+}
+
+// UpdateActivity updates the last active timestamp for connection heartbeat & dead reaper
+func (c *Client) UpdateActivity() {
+	atomic.StoreInt64(&c.lastActiveMs, time.Now().UnixMilli())
+}
+
+// LastActive returns the timestamp of last received packet/heartbeat in milliseconds
+func (c *Client) LastActive() int64 {
+	return atomic.LoadInt64(&c.lastActiveMs)
 }
 
 // safeWriteMessage writes a message with serialized writeMu protection
@@ -89,12 +106,14 @@ func (c *Client) ReadPump() {
 
 	c.Conn.SetPongHandler(func(string) error {
 		c.Conn.SetReadDeadline(time.Now().Add(pongWait))
+		c.UpdateActivity()
 		return nil
 	})
 
 	// When client sends Ping (e.g. OkHttp pingInterval), reply with Pong safely without colliding with WritePump
 	c.Conn.SetPingHandler(func(appData string) error {
 		c.Conn.SetReadDeadline(time.Now().Add(pongWait))
+		c.UpdateActivity()
 		return c.safeWriteControl(websocket.PongMessage, []byte(appData))
 	})
 
@@ -105,6 +124,22 @@ func (c *Client) ReadPump() {
 			break
 		}
 		c.Conn.SetReadDeadline(time.Now().Add(pongWait))
+		c.UpdateActivity()
+
+		// ⚡ Ultra-fast zero-alloc Binary Ping Interception:
+		// [0x08][8B Client Timestamp] = 9 Bytes Total
+		// Direct instant response via safeWriteMessage avoids any queue backlog
+		if msgType == websocket.BinaryMessage && len(message) == 9 && message[0] == BinOpPing {
+			now := time.Now().UnixMilli()
+			last := atomic.LoadInt64(&c.lastPingMs)
+			if now-last >= 500 { // 500ms rate limit (max 1 ping response per 500ms per client)
+				atomic.StoreInt64(&c.lastPingMs, now)
+				var echo [9]byte
+				copy(echo[:], message[:9])
+				_ = c.safeWriteMessage(websocket.BinaryMessage, echo[:])
+			}
+			continue
+		}
 
 		if c.onMessage != nil {
 			c.onMessage(c, msgType, message)

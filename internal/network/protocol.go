@@ -36,12 +36,16 @@ const (
 const (
 	BinOpWorldState    byte = 0x01 // 30 TPS Unified Frame (Players + Eaten Frame Batch + Spawned Frame Batch)
 	BinOpInput         byte = 0x02 // Steering & Boost input
-	BinOpPing          byte = 0x03
-	BinOpPong          byte = 0x04
+	BinOpPingLegacy    byte = 0x03 // Legacy Ping Keepalive
+	BinOpPongLegacy    byte = 0x04 // Legacy Pong Keepalive
 	BinOpFoodRelay     byte = 0x05 // Pure Binary Food Data Relay
 	BinOpEatBatch      byte = 0x06 // Binary Eaten Food Action / Frame Batch Relay
 	BinOpLocation      byte = 0x07 // Direct authoritative client location stream
-	BinOpLocationSync  byte = 0x08 // Authoritative server position sync (dead reckoning recovery)
+	BinOpPing          byte = 0x08 // Ultra-fast zero-alloc Binary Ping (9 Bytes: [0x08][8B LittleEndian Timestamp])
+	BinOpPong          byte = 0x08 // Ultra-fast zero-alloc Binary Pong (9 Bytes: [0x08][8B LittleEndian Timestamp])
+	OP_PING            byte = 0x08 // Opcode alias
+	OP_PONG            byte = 0x08 // Opcode alias
+	BinOpLocationSync  byte = 0x09 // Authoritative server position sync (dead reckoning recovery)
 )
 
 // ChatPayload represents real-time chat message broadcast
