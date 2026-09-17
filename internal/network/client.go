@@ -26,6 +26,7 @@ type WSMessage struct {
 // Client represents a single active WebSocket connection
 type Client struct {
 	ID        string
+	Name      string
 	Conn      *websocket.Conn
 	Send      chan WSMessage
 	done      chan struct{} // Closed when client disconnects to instantly terminate WritePump

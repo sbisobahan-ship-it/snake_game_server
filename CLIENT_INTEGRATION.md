@@ -9,6 +9,7 @@ This document contains the complete server endpoints, connection URLs, binary ne
 | Service / Endpoint | Protocol | URL | Description |
 | :--- | :--- | :--- | :--- |
 | **🎮 Game WebSocket** | `WS` | `ws://192.168.0.114:8080/ws` | Real-time 30 FPS game stream & player inputs |
+| **🔄 Reconnect WebSocket** | `WS` | `ws://192.168.0.114:8080/ws?token=<SESSION_TOKEN>` | Instant token-based reconnection & state catch-up |
 | **📱 Emulator WebSocket** | `WS` | `ws://10.0.2.2:8080/ws` | Android Studio Emulator connection |
 | **💻 Localhost WebSocket** | `WS` | `ws://localhost:8080/ws` | Local PC connection |
 | **🛡️ Admin Telemetry** | `HTTP` | `http://192.168.0.114:8080/dashboard` | Multi-terminal live telemetry monitor |
@@ -18,22 +19,152 @@ This document contains the complete server endpoints, connection URLs, binary ne
 
 ---
 
-## ⚡ 2. Network Protocol Specification
+## 🔑 2. Token-Based Session Management & Reconnection
+
+### 1. Game Start & Token Issuance
+When the client starts a match, the server generates a unique 32-character session `token` and returns it in `started` and `joined` packets.
+- **Client Action:** Store `token` in local storage / SQLite / SharedPreferences.
+
+```json
+{
+  "type": "started",
+  "payload": {
+    "id": "p_1",
+    "token": "tok_9f82d1c4b7204e19a4b3d76e28f1025a",
+    "name": "PlayerName",
+    "skin_id": 1,
+    "spawn_x": 2500.0,
+    "spawn_y": 3000.0,
+    "angle": 1.57,
+    "score": 0,
+    "alive": true,
+    "start": true,
+    "world_w": 30000,
+    "world_h": 30000,
+    "tick_rate": 30,
+    "timestamp": 1740000000000
+  }
+}
+```
+
+---
+
+## 📡 3. Two-Step Disconnection Detection Architecture
+
+To detect network loss and socket drops with minimal delay:
+
+### 🔹 Step 1: Local Network Listener (OS Network Callbacks)
+- Register Android `ConnectivityManager.NetworkCallback` / iOS Network Path Monitor.
+- When internet drops (Wi-Fi off, Airplane mode, mobile network loss), **immediately trigger offline state** and stop trying until internet returns.
+- When the OS notifies that internet connectivity is restored, **instantly initiate reconnection** using the saved `token`.
+
+### 🔹 Step 2: Server Inactivity / Data Timeout
+- If the socket remains open but no packets or pings arrive from the server for **4–5 seconds**, treat the connection as broken.
+- Close the existing socket forcefully and initiate the reconnection workflow.
+
+### 🔄 Reconnection Flow & Retry Policy:
+1. **Immediate Retry with Exponential Backoff:**
+   - 1st attempt: Immediate (0 ms)
+   - 2nd attempt: 1.0s delay
+   - 3rd attempt: 3.0s delay
+2. **Offline Pause:** If 3 attempts fail and OS indicates no network, pause retrying.
+3. **Instant Resume:** As soon as OS Network Callback fires network restored, immediately connect to `ws://HOST:8080/ws?token=<SAVED_TOKEN>` or send `{"type": "reconnect", "token": "<SAVED_TOKEN>"}`.
+
+---
+
+## 📦 4. Reconnection Responses (Server Authoritative)
+
+### A. Living Snake Reconnected (`reconnect_success`)
+If the snake is still alive in the arena, the server instantly sends the complete catch-up snapshot:
+```json
+{
+  "type": "reconnect_success",
+  "payload": {
+    "id": "p_1",
+    "token": "tok_9f82d1c4b7204e19a4b3d76e28f1025a",
+    "name": "PlayerName",
+    "spawn_x": 2840.5,
+    "spawn_y": 3120.0,
+    "angle": 1.57,
+    "score": 140,
+    "alive": true,
+    "boost": false,
+    "skin_id": 1,
+    "body": [{"x": 2828.5, "y": 3120.0}, {"x": 2816.5, "y": 3120.0}],
+    "world_w": 30000,
+    "world_h": 30000,
+    "tick_rate": 30,
+    "timestamp": 1740000015000
+  }
+}
+```
+*Client snaps its rendering to these authoritative coordinates and resumes normal gameplay.*
+
+### B. Snake Died While Offline (`game_over`)
+If the snake died while the client was disconnected (e.g., collided with a wall or another snake):
+```json
+{
+  "type": "game_over",
+  "payload": {
+    "id": "p_1",
+    "token": "tok_9f82d1c4b7204e19a4b3d76e28f1025a",
+    "status": "dead",
+    "reason": "left_or_defeated",
+    "final_score": 140,
+    "died_at": 1740000012000
+  }
+}
+```
+*Client clears local token and displays Game Over / Results screen.*
+
+---
+
+## ⚡ 5. Network Protocol Specification
 
 All binary numbers are encoded in **Little-Endian** format.
 
 ### 📤 A. Client -> Server Messages
 
-#### 1. Join Game (JSON upon connecting)
+#### 1. Start Game / Join Game (JSON sent when user clicks "Start Game")
+Connecting to the WebSocket establishes the link (`welcome` packet received), but **the game/snake will NOT start until the client explicitly sends a start call**.
+
+* **Single-line String to send over WebSocket when Start Game is pressed:**
+```json
+{"type": "start", "payload": {"start": true, "name": "PlayerName", "skin_id": 1}}
+```
+*(Or compact: `{"type":"start","start":true,"name":"PlayerName"}` or `{"type":"join","payload":{"start":true}}`)*
+
+* **Server replies with `started` (and `joined`) confirmation packet:**
 ```json
 {
-  "type": "join",
+  "type": "started",
   "payload": {
+    "start": true,
+    "id": "p_1",
     "name": "PlayerName",
-    "skin_id": 1
+    "skin_id": 1,
+    "spawn_x": 2500.0,
+    "spawn_y": 3000.0,
+    "angle": 1.57,
+    "score": 0,
+    "alive": true,
+    "world_w": 30000,
+    "world_h": 30000,
+    "tick_rate": 30,
+    "timestamp": 1740000000000
   }
 }
 ```
+
+#### 2. Defeat / Player Die / Reset / Leave (JSON on Game Over)
+When the player dies or leaves, client can send:
+```json
+{
+  "type": "player_die"
+}
+```
+*(Aliases: `"defeat"`, `"die"`, `"leave"`, `"default"`, `"reset"`)*
+*Server replies with `player_die_ack` and player can immediately send `join` or `respawn` on the same connection to play again.*
 
 #### 2. Snake Location Stream (Binary - 14 Bytes, Real-Time / 30-60 FPS)
 * Client only sends its snake coordinates. The server authoritatively calculates food collisions when the snake passes over static foods.
@@ -62,6 +193,37 @@ All binary numbers are encoded in **Little-Endian** format.
   - `[Byte 0]` : `0x02` (Opcode: `BinOpInput`)
   - `[Bytes 1..4]` : `Float32` (Angle in Radians, Little-Endian)
   - `[Byte 5]` : `Uint8` (`1` = Boost Active, `0` = Normal)
+
+#### 4. Location Sync Request (Lag Recovery / Dead Reckoning Sync)
+When a client experiences network lag or disconnects temporarily:
+- The **Server is 100% Authoritative**: In the server's 30 TPS simulation loop, the snake continues moving forward along its last known angle/speed (Dead Reckoning). Any foods eaten or boundary collisions during this time are authoritatively resolved on the server.
+- When connection resumes, client requests sync via JSON `{"type": "sync"}` or Binary `[0x08]` (or in Ping response).
+- **Server Response (`location_sync` / Binary `0x08`):**
+```json
+{
+  "type": "location_sync",
+  "payload": {
+    "id": "p_1",
+    "name": "PlayerName",
+    "x": 2150.4,
+    "y": 1820.0,
+    "angle": 1.57,
+    "score": 45,
+    "alive": true,
+    "boost": false,
+    "body": [{"x": 2138.4, "y": 1820.0}, ...]
+  }
+}
+```
+* **Binary Response Format (`0x08`):**
+  - `[Byte 0]` : `0x08` (`BinOpLocationSync`)
+  - `[Bytes 1..4]` : `Float32` (Authoritative Head X)
+  - `[Bytes 5..8]` : `Float32` (Authoritative Head Y)
+  - `[Bytes 9..12]` : `Float32` (Authoritative Angle)
+  - `[Bytes 13..16]` : `Int32` (Authoritative Score)
+  - `[Byte 17]` : `Uint8` (Bit 0: Alive, Bit 1: Boost)
+  - `[Bytes 18..19]` : `Uint16` (Body Segments Count `S`)
+  - For each of the `S` segments: `[4B Float32 SegX][4B Float32 SegY]`
 
 ---
 

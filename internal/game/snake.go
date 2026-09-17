@@ -12,7 +12,7 @@ const (
 	SegmentSpacing    = 12.0  // Distance between body segments
 	DefaultHeadRadius = 14.0
 	DefaultBodyRadius = 12.0
-	InitialSegments   = 10
+	InitialSegments   = 12
 )
 
 // Snake represents a player's snake entity in the game
@@ -29,9 +29,10 @@ type Snake struct {
 	Body         []physics.Vector2D `json:"body"`   // Ordered list of segment positions
 	HeadRadius   float64            `json:"head_r"` // Radius for collision detection
 	BodyRadius   float64            `json:"body_r"`
-	Score        int                `json:"score"`
-	SkinID       int                `json:"skin_id"`
-	TargetLength int                `json:"target_length"`
+	Score            int                `json:"score"`
+	SkinID           int                `json:"skin_id"`
+	TargetLength     int                `json:"target_length"`
+	StaticFoodsEaten int                `json:"static_foods_eaten"`
 }
 
 // NewSnake instantiates a fresh snake entity at spawn position
@@ -46,21 +47,22 @@ func NewSnake(id string, spawnPos physics.Vector2D, angle float64, skinID int) *
 	}
 
 	return &Snake{
-		ID:           id,
-		Head:         spawnPos,
-		Angle:        angle,
-		TargetAngle:  angle,
-		Speed:        DefaultBaseSpeed,
-		BaseSpeed:    DefaultBaseSpeed,
-		BoostSpeed:   DefaultBoostSpeed,
-		IsBoosting:   false,
-		IsAlive:      true,
-		Body:         body,
-		HeadRadius:   DefaultHeadRadius,
-		BodyRadius:   DefaultBodyRadius,
-		Score:        0,
-		SkinID:       skinID,
-		TargetLength: InitialSegments,
+		ID:               id,
+		Head:             spawnPos,
+		Angle:            angle,
+		TargetAngle:      angle,
+		Speed:            DefaultBaseSpeed,
+		BaseSpeed:        DefaultBaseSpeed,
+		BoostSpeed:       DefaultBoostSpeed,
+		IsBoosting:       false,
+		IsAlive:          true,
+		Body:             body,
+		HeadRadius:       DefaultHeadRadius,
+		BodyRadius:       DefaultBodyRadius,
+		Score:            0,
+		SkinID:           skinID,
+		TargetLength:     InitialSegments,
+		StaticFoodsEaten: 0,
 	}
 }
 
@@ -118,6 +120,27 @@ func (s *Snake) UpdatePosition(dt float64) {
 func (s *Snake) Grow(amount int) {
 	s.Score += amount
 	s.TargetLength = InitialSegments + (s.Score / 5)
+
+	for len(s.Body) < s.TargetLength {
+		lastIdx := len(s.Body) - 1
+		var newSeg physics.Vector2D
+		if lastIdx >= 0 {
+			newSeg = s.Body[lastIdx]
+		} else {
+			newSeg = s.Head
+		}
+		s.Body = append(s.Body, newSeg)
+	}
+}
+
+// EatStaticFood records eating static food: 6 static foods = 1 score point & 1 body segment growth
+func (s *Snake) EatStaticFood(count int) {
+	if count <= 0 {
+		count = 1
+	}
+	s.StaticFoodsEaten += count
+	s.Score = s.StaticFoodsEaten / 6
+	s.TargetLength = InitialSegments + (s.StaticFoodsEaten / 6)
 
 	for len(s.Body) < s.TargetLength {
 		lastIdx := len(s.Body) - 1

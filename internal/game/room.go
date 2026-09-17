@@ -1,6 +1,9 @@
 package game
 
 import (
+	crand "crypto/rand"
+	"encoding/hex"
+	"fmt"
 	"log"
 	"math"
 	"math/rand"
@@ -15,15 +18,18 @@ import (
 
 // PlayerDTO represents lightweight player state for transport
 type PlayerDTO struct {
-	ID      string             `json:"id"`
-	Name    string             `json:"name"`
-	Head    physics.Vector2D   `json:"head"`
-	Angle   float64            `json:"angle"`
-	Body    []physics.Vector2D `json:"body"`
-	Score   int                `json:"score"`
-	IsAlive bool               `json:"alive"`
-	SkinID  int                `json:"skin"`
-	IsBoost bool               `json:"boost"`
+	ID               string             `json:"id"`
+	Token            string             `json:"token,omitempty"`
+	Name             string             `json:"name"`
+	Head             physics.Vector2D   `json:"head"`
+	Angle            float64            `json:"angle"`
+	Body             []physics.Vector2D `json:"body"`
+	Score            int                `json:"score"`
+	IsAlive          bool               `json:"alive"`
+	SkinID           int                `json:"skin"`
+	IsBoost          bool               `json:"boost"`
+	StaticFoodsEaten int                `json:"static_foods_eaten"`
+	Segments         int                `json:"segments"`
 }
 
 // FoodEatenEvent represents a food consumed during this tick frame batch
@@ -64,11 +70,22 @@ type EatRequest struct {
 	ScoreGain int
 }
 
+// generateSessionToken generates a cryptographically secure 32-character hex session token
+func generateSessionToken() string {
+	b := make([]byte, 16)
+	if _, err := crand.Read(b); err != nil {
+		return fmt.Sprintf("tok_%d_%d", time.Now().UnixNano(), rand.Int63())
+	}
+	return "tok_" + hex.EncodeToString(b)
+}
+
 // Room manages an active match / arena instance with authoritative tick loop
 type Room struct {
 	ID              string
 	Config          *config.Config
 	Players         map[string]*Player
+	tokenToPlayer   map[string]*Player      // Fast lookup: Token -> Active Living Player
+	deadSessions    map[string]*DeadSession // Lookup: Token -> Terminal dead state info
 	Foods           map[uint32]*Food
 	StaticFoods     *StaticFoodRegistry // 10k static food spatial dataset (30kx30k canvas)
 	consumedFoodIDs map[uint32]int64    // Fast lookup: foodID -> expireAt timestamp (ms)
@@ -92,6 +109,8 @@ func NewRoom(id string, cfg *config.Config, broadcastFn func(state *WorldState))
 		ID:              id,
 		Config:          cfg,
 		Players:         make(map[string]*Player),
+		tokenToPlayer:   make(map[string]*Player),
+		deadSessions:    make(map[string]*DeadSession),
 		Foods:           make(map[uint32]*Food),
 		consumedFoodIDs: make(map[uint32]int64, 4096),
 		consumedQueue:   make([]consumedFoodEntry, 0, 512),
@@ -171,10 +190,49 @@ func (r *Room) SpawnCustomFoods(count int) int {
 	return len(r.Foods)
 }
 
-// AddPlayer adds a new player with a random spawn location inside canvas
+// AddPlayer adds a new player with a generated token or smoothly reconnects an existing living player
 func (r *Room) AddPlayer(id, name string, skinID int) *Player {
+	return r.AddPlayerWithToken(id, "", name, skinID)
+}
+
+// AddPlayerWithToken adds or reconnects a player with an explicit or newly generated session token
+func (r *Room) AddPlayerWithToken(id, token, name string, skinID int) *Player {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+
+	// 1. If existing living player found by ID or Token, reconnect it!
+	if existing, exists := r.Players[id]; exists && existing.Snake != nil && existing.Snake.IsAlive {
+		existing.IsConnected = true
+		existing.DisconnectedAt = 0
+		if name != "" {
+			existing.Name = name
+		}
+		if skinID > 0 {
+			existing.Snake.SkinID = skinID
+		}
+		monitor.DefaultHub.Emit(monitor.ChanPlayer, "success", "🎮 [PLAYER RECONNECTED] ID: %s | Token: %s | Name: '%s' | Live Pos: (%.0f, %.0f) | Score: %d", id, existing.Token, existing.Name, existing.Snake.Head.X, existing.Snake.Head.Y, existing.Snake.Score)
+		return existing
+	}
+
+	if token != "" {
+		if existing, exists := r.tokenToPlayer[token]; exists && existing.Snake != nil && existing.Snake.IsAlive {
+			existing.IsConnected = true
+			existing.DisconnectedAt = 0
+			if name != "" {
+				existing.Name = name
+			}
+			monitor.DefaultHub.Emit(monitor.ChanPlayer, "success", "🎮 [PLAYER RECONNECTED BY TOKEN] ID: %s | Token: %s | Name: '%s' | Live Pos: (%.0f, %.0f) | Score: %d", existing.ID, token, existing.Name, existing.Snake.Head.X, existing.Snake.Head.Y, existing.Snake.Score)
+			return existing
+		}
+	}
+
+	// 2. Generate a new session token if none provided
+	if token == "" {
+		token = generateSessionToken()
+	}
+
+	// Clean up any old dead session record for this token if starting fresh
+	delete(r.deadSessions, token)
 
 	minX := 2000.0
 	maxX := math.Max(minX+1000.0, r.Config.WorldWidth-2000.0)
@@ -187,21 +245,105 @@ func (r *Room) AddPlayer(id, name string, skinID int) *Player {
 	}
 	angle := rand.Float64() * 2 * math.Pi
 
-	player := NewPlayer(id, name, spawnPos, angle, skinID)
+	player := NewPlayer(id, token, name, spawnPos, angle, skinID)
 	r.Players[id] = player
+	r.tokenToPlayer[token] = player
 
-	monitor.DefaultHub.Emit(monitor.ChanPlayer, "success", "🎮 [PLAYER JOINED] ID: %s | Name: '%s' | Skin: %d | Spawn: (%.0f, %.0f)", id, name, skinID, spawnPos.X, spawnPos.Y)
+	monitor.DefaultHub.Emit(monitor.ChanPlayer, "success", "🎮 [PLAYER JOINED] ID: %s | Token: %s | Name: '%s' | Skin: %d | Spawn: (%.0f, %.0f)", id, token, name, skinID, spawnPos.X, spawnPos.Y)
 
 	return player
 }
 
-// RemovePlayer cleans up player on disconnect
+// GetPlayerByToken looks up active living player associated with session token
+func (r *Room) GetPlayerByToken(token string) (*Player, bool) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	p, exists := r.tokenToPlayer[token]
+	if !exists || p == nil || p.Snake == nil || !p.Snake.IsAlive {
+		return nil, false
+	}
+	return p, true
+}
+
+// GetDeadSession retrieves terminal state info of a dead player session by token
+func (r *Room) GetDeadSession(token string) (*DeadSession, bool) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	ds, exists := r.deadSessions[token]
+	return ds, exists
+}
+
+// MarkPlayerDisconnected preserves player entity and lets snake continue moving forward via server dead reckoning
+func (r *Room) MarkPlayerDisconnected(id string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if p, exists := r.Players[id]; exists {
+		p.IsConnected = false
+		p.DisconnectedAt = time.Now().UnixMilli()
+		monitor.DefaultHub.Emit(monitor.ChanPlayer, "warn", "🔌 [PLAYER DISCONNECTED (PRESERVED)] ID: %s | Token: %s | Name: '%s' (Snake continues alive in arena)", id, p.Token, p.Name)
+	}
+}
+
+// RecordPlayerDeath records terminal session details for dead snake and clears active token mapping
+func (r *Room) RecordPlayerDeath(playerID, reason string) *DeadSession {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	p, exists := r.Players[playerID]
+	if !exists {
+		return nil
+	}
+
+	score := 0
+	if p.Snake != nil {
+		p.Snake.IsAlive = false
+		score = p.Snake.Score
+	}
+	p.DeathReason = reason
+	p.DiedAt = time.Now().UnixMilli()
+
+	ds := &DeadSession{
+		Token:       p.Token,
+		PlayerID:    p.ID,
+		Name:        p.Name,
+		FinalScore:  score,
+		DeathReason: reason,
+		DiedAt:      p.DiedAt,
+	}
+	if p.Token != "" {
+		r.deadSessions[p.Token] = ds
+		delete(r.tokenToPlayer, p.Token)
+	}
+
+	return ds
+}
+
+// RemovePlayer cleans up player on explicit leave or defeat and registers dead session
 func (r *Room) RemovePlayer(id string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
 	if p, exists := r.Players[id]; exists {
-		monitor.DefaultHub.Emit(monitor.ChanPlayer, "warn", "👋 [PLAYER LEFT] ID: %s | Name: '%s' | Final Score: %d", id, p.Name, p.Snake.Score)
+		score := 0
+		if p.Snake != nil {
+			p.Snake.IsAlive = false
+			score = p.Snake.Score
+		}
+		if p.Token != "" {
+			r.deadSessions[p.Token] = &DeadSession{
+				Token:       p.Token,
+				PlayerID:    p.ID,
+				Name:        p.Name,
+				FinalScore:  score,
+				DeathReason: "left_or_defeated",
+				DiedAt:      time.Now().UnixMilli(),
+			}
+			delete(r.tokenToPlayer, p.Token)
+		}
+		monitor.DefaultHub.Emit(monitor.ChanPlayer, "warn", "👋 [PLAYER REMOVED] ID: %s | Name: '%s' | Final Score: %d", id, p.Name, score)
 		delete(r.Players, id)
 	}
 }
@@ -230,13 +372,13 @@ func (r *Room) checkCollisionsForPlayerLocked(p *Player) []FoodEatenEvent {
 	if r.StaticFoods != nil {
 		eatenEvents := r.StaticFoods.CheckCollisions(p.ID, s.Head.X, s.Head.Y, s.HeadRadius)
 		for _, ef := range eatenEvents {
-			s.Grow(ef.NewScore) // NewScore in ef originally holds Value gained
+			s.EatStaticFood(1)
 			ef.NewScore = s.Score
 			r.pendingEaten = append(r.pendingEaten, ef)
 			atomic.AddUint64(&r.totalEaten, 1)
 			eatenList = append(eatenList, ef)
 
-			monitor.DefaultHub.Emit(monitor.ChanFood, "eat", "🍎 [SERVER COLLISION EAT] Player '%s' ate Static Food #%d at (%.0f, %.0f) -> New Score: %d", p.ID, ef.FoodID, s.Head.X, s.Head.Y, s.Score)
+			monitor.DefaultHub.Emit(monitor.ChanFood, "eat", "🍎 [SERVER COLLISION EAT] Player '%s' ate Static Food #%d | Total Foods: %d -> Score: %d | Segments: %d", p.ID, ef.FoodID, s.StaticFoodsEaten, s.Score, len(s.Body))
 		}
 	}
 
@@ -423,11 +565,7 @@ func (r *Room) ClaimAndEatFood(playerID string, foodID uint32, scoreGain int) (a
 	// 1. Try static food registry first
 	if r.StaticFoods != nil {
 		if sf, ok := r.StaticFoods.ClaimFood(foodID, playerID); ok {
-			gain := int(sf.Value)
-			if scoreGain > 0 {
-				gain = scoreGain
-			}
-			player.Snake.Grow(gain)
+			player.Snake.EatStaticFood(1)
 			newScore = player.Snake.Score
 
 			r.pendingEaten = append(r.pendingEaten, FoodEatenEvent{
@@ -483,11 +621,7 @@ func (r *Room) ClaimAndEatFoodWithColor(playerID string, foodID uint32, scoreGai
 
 	if r.StaticFoods != nil {
 		if sf, ok := r.StaticFoods.ClaimFood(foodID, playerID); ok {
-			gain := int(sf.Value)
-			if scoreGain > 0 {
-				gain = scoreGain
-			}
-			player.Snake.Grow(gain)
+			player.Snake.EatStaticFood(1)
 			newScore = player.Snake.Score
 
 			r.pendingEaten = append(r.pendingEaten, FoodEatenEvent{
@@ -497,7 +631,7 @@ func (r *Room) ClaimAndEatFoodWithColor(playerID string, foodID uint32, scoreGai
 				NewScore:   newScore,
 			})
 			atomic.AddUint64(&r.totalEaten, 1)
-			return sf.FruitIndex, gain, newScore, true
+			return sf.FruitIndex, 1, newScore, true
 		}
 	}
 
@@ -664,15 +798,17 @@ func (r *Room) getWorldStateLocked() *WorldState {
 			continue
 		}
 		playerDTOs = append(playerDTOs, PlayerDTO{
-			ID:      p.ID,
-			Name:    p.Name,
-			Head:    p.Snake.Head,
-			Angle:   p.Snake.Angle,
-			Body:    p.Snake.Body,
-			Score:   p.Snake.Score,
-			IsAlive: p.Snake.IsAlive,
-			SkinID:  p.Snake.SkinID,
-			IsBoost: p.Snake.IsBoosting,
+			ID:               p.ID,
+			Name:             p.Name,
+			Head:             p.Snake.Head,
+			Angle:            p.Snake.Angle,
+			Body:             p.Snake.Body,
+			Score:            p.Snake.Score,
+			IsAlive:          p.Snake.IsAlive,
+			SkinID:           p.Snake.SkinID,
+			IsBoost:          p.Snake.IsBoosting,
+			StaticFoodsEaten: p.Snake.StaticFoodsEaten,
+			Segments:         len(p.Snake.Body),
 		})
 	}
 
@@ -689,6 +825,36 @@ func (r *Room) GetPlayerCount() int {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	return len(r.Players)
+}
+
+// GetPlayerSync returns authoritative player snapshot for network lag recovery / synchronization
+func (r *Room) GetPlayerSync(playerID string) (*PlayerDTO, bool) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	p, exists := r.Players[playerID]
+	if !exists || p.Snake == nil {
+		return nil, false
+	}
+
+	bodyCopy := make([]physics.Vector2D, len(p.Snake.Body))
+	copy(bodyCopy, p.Snake.Body)
+
+	dto := &PlayerDTO{
+		ID:               p.ID,
+		Token:            p.Token,
+		Name:             p.Name,
+		Head:             p.Snake.Head,
+		Angle:            p.Snake.Angle,
+		Body:             bodyCopy,
+		Score:            p.Snake.Score,
+		IsAlive:          p.Snake.IsAlive,
+		SkinID:           p.Snake.SkinID,
+		IsBoost:          p.Snake.IsBoosting,
+		StaticFoodsEaten: p.Snake.StaticFoodsEaten,
+		Segments:         len(p.Snake.Body),
+	}
+	return dto, true
 }
 
 // StartGameLoop starts the authoritative room tick loop in a goroutine

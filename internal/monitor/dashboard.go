@@ -197,22 +197,21 @@ const DashboardHTML = `<!DOCTYPE html>
             background: rgba(244, 63, 94, 0.35);
         }
 
-        /* 4-Terminal Grid Layout */
+        /* Multi-Terminal Grid Layout */
         .grid-container {
             flex: 1;
             display: grid;
             grid-template-columns: 1fr 1fr;
-            grid-template-rows: 1fr 1fr;
+            grid-template-rows: auto 1fr 1fr;
             gap: 12px;
             padding: 12px;
-            overflow: hidden;
+            overflow-y: auto;
         }
 
         @media (max-width: 960px) {
             .grid-container {
                 grid-template-columns: 1fr;
-                grid-template-rows: repeat(4, 1fr);
-                overflow-y: auto;
+                grid-template-rows: auto repeat(4, 1fr);
             }
         }
 
@@ -227,6 +226,7 @@ const DashboardHTML = `<!DOCTYPE html>
             box-shadow: 0 8px 24px rgba(0, 0, 0, 0.45);
         }
 
+        .panel-location { grid-column: 1 / -1; border-top: 3px solid var(--neon-cyan); min-height: 120px; }
         .panel-food { border-top: 3px solid var(--neon-cyan); }
         .panel-player { border-top: 3px solid var(--neon-green); }
         .panel-network { border-top: 3px solid var(--neon-blue); }
@@ -408,8 +408,24 @@ const DashboardHTML = `<!DOCTYPE html>
         </div>
     </header>
 
-    <!-- 4 Dedicated Terminal Panels -->
+    <!-- 5 Dedicated Terminal Panels -->
     <div class="grid-container">
+
+        <!-- 0. REAL-TIME MULTI-DEVICE LOCATIONS & FPS TERMINAL -->
+        <div class="terminal-panel panel-location">
+            <div class="terminal-header">
+                <div class="terminal-title" style="color: var(--neon-cyan);">
+                    <span>📍 [TERMINAL 0: REAL-TIME DEVICE STATE & LOCATIONS - MULTI-DEVICE SUPPORT]</span>
+                    <span class="terminal-count" id="count-devices">0 Devices Active</span>
+                </div>
+                <div class="terminal-controls">
+                    <span style="font-size: 11px; color: var(--neon-green); font-family:'Fira Code', monospace; font-weight: 600;">⚡ Live Stream Active</span>
+                </div>
+            </div>
+            <div class="terminal-body" id="body-devices" style="padding: 10px; display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 10px; align-content: flex-start; max-height: 220px; overflow-y: auto;">
+                <div class="empty-placeholder" id="devices-empty" style="grid-column: 1 / -1;">🔴 No active client devices streaming location. Start the Android game client to see live X, Y, Angle & Stream FPS.</div>
+            </div>
+        </div>
 
         <!-- 1. FOOD TERMINAL -->
         <div class="terminal-panel panel-food">
@@ -576,6 +592,20 @@ const DashboardHTML = `<!DOCTYPE html>
                 try {
                     var data = JSON.parse(event.data);
 
+                    if (data.channel === 'locations') {
+                        if (data.level === 'remove' && data.data && data.data.id) {
+                            var card = document.getElementById('dev-card-' + data.data.id);
+                            if (card) card.remove();
+                            var container = document.getElementById('body-devices');
+                            if (container && container.getElementsByClassName('device-card').length === 0) {
+                                container.innerHTML = '<div class="empty-placeholder" id="devices-empty" style="grid-column: 1 / -1;">🔴 No active client devices streaming location. Start the Android game client to see live X, Y, Angle & Stream FPS.</div>';
+                            }
+                        } else if (data.data) {
+                            updateSingleDeviceCard(data.data);
+                        }
+                        return;
+                    }
+
                     if (data.channel === 'metrics' && data.data) {
                         var m = data.data;
                         document.getElementById('stat-tps').textContent = m.tick_rate || 30;
@@ -586,6 +616,8 @@ const DashboardHTML = `<!DOCTYPE html>
                         document.getElementById('stat-foods').textContent = m.total_foods || 0;
                         document.getElementById('stat-eaten').textContent = m.total_eaten || 0;
                         document.getElementById('stat-ram').textContent = (m.alloc_mem_mb || 0).toFixed(1) + ' MB';
+                        
+                        renderDevices(m.devices || []);
                         return;
                     }
 
@@ -635,6 +667,100 @@ const DashboardHTML = `<!DOCTYPE html>
             body.innerHTML = '<div class="empty-placeholder">Terminal log cleared.</div>';
             counts[chan] = 0;
             document.getElementById('count-' + chan).textContent = '0 events';
+        }
+
+        function updateSingleDeviceCard(dev) {
+            var container = document.getElementById('body-devices');
+            if (!container || !dev || !dev.id) return;
+
+            var emptyPlaceholder = document.getElementById('devices-empty');
+            if (emptyPlaceholder) {
+                emptyPlaceholder.remove();
+            }
+
+            var cardId = 'dev-card-' + dev.id;
+            var card = document.getElementById(cardId);
+            var fpsVal = (dev.fps || 0).toFixed(1);
+            var angleRad = (dev.angle || 0).toFixed(2);
+            var angleDeg = (dev.angle_deg || 0).toFixed(1);
+
+            if (!card) {
+                card = document.createElement('div');
+                card.id = cardId;
+                card.className = 'device-card';
+                card.style.cssText = 'background: rgba(15, 23, 42, 0.95); border: 1px solid rgba(56, 189, 248, 0.3); border-radius: 8px; padding: 10px; font-family: "Fira Code", monospace; box-shadow: 0 4px 12px rgba(0,0,0,0.3);';
+                
+                card.innerHTML = 
+                    '<div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:6px;">' +
+                        '<span style="font-weight:700; color:#38bdf8; font-size:12px;">🎮 <span id="dev-name-' + dev.id + '">' + (dev.name || dev.id) + '</span></span>' +
+                        '<span style="background:rgba(34,197,94,0.2); color:#22c55e; border:1px solid #22c55e; padding:1px 6px; border-radius:4px; font-size:10px; font-weight:700;">🟢 <span id="dev-fps-' + dev.id + '">' + fpsVal + '</span> FPS</span>' +
+                    '</div>' +
+                    '<div style="display:grid; grid-template-columns:1fr 1fr; gap:4px; font-size:11px; color:#cbd5e1;">' +
+                        '<div>📍 X: <span style="color:#fff; font-weight:700;" id="dev-x-' + dev.id + '">' + dev.x.toFixed(1) + '</span></div>' +
+                        '<div>📍 Y: <span style="color:#fff; font-weight:700;" id="dev-y-' + dev.id + '">' + dev.y.toFixed(1) + '</span></div>' +
+                        '<div>📐 Angle: <span style="color:#f59e0b; font-weight:700;" id="dev-angle-' + dev.id + '">' + angleRad + ' rad</span></div>' +
+                        '<div>🔄 Heading: <span style="color:#a855f7; font-weight:700;" id="dev-deg-' + dev.id + '">' + angleDeg + '°</span></div>' +
+                    '</div>' +
+                    '<div style="margin-top:6px; font-size:9.5px; color:#64748b; display:flex; justify-content:space-between;">' +
+                        '<span>Packets: <span id="dev-pkts-' + dev.id + '">' + (dev.packets || 0) + '</span></span>' +
+                        '<span>ID: ' + dev.id + '</span>' +
+                    '</div>';
+                container.appendChild(card);
+            } else {
+                // High-speed text node mutation (super fast, 60+ FPS instantaneous response)
+                var xEl = document.getElementById('dev-x-' + dev.id);
+                var yEl = document.getElementById('dev-y-' + dev.id);
+                var angleEl = document.getElementById('dev-angle-' + dev.id);
+                var degEl = document.getElementById('dev-deg-' + dev.id);
+                var fpsEl = document.getElementById('dev-fps-' + dev.id);
+                var pktsEl = document.getElementById('dev-pkts-' + dev.id);
+                var nameEl = document.getElementById('dev-name-' + dev.id);
+
+                if (xEl) xEl.textContent = dev.x.toFixed(1);
+                if (yEl) yEl.textContent = dev.y.toFixed(1);
+                if (angleEl) angleEl.textContent = angleRad + ' rad';
+                if (degEl) degEl.textContent = angleDeg + '°';
+                if (fpsEl) fpsEl.textContent = fpsVal;
+                if (pktsEl) pktsEl.textContent = dev.packets || 0;
+                if (nameEl && dev.name) nameEl.textContent = dev.name;
+            }
+
+            var countEl = document.getElementById('count-devices');
+            if (countEl) {
+                var total = container.getElementsByClassName('device-card').length;
+                countEl.textContent = total + ' Device(s) Active';
+            }
+        }
+
+        function renderDevices(devices) {
+            var countEl = document.getElementById('count-devices');
+            var container = document.getElementById('body-devices');
+            if (!container) return;
+
+            if (countEl) {
+                countEl.textContent = (devices ? devices.length : 0) + ' Device(s) Active';
+            }
+
+            if (!devices || devices.length === 0) {
+                container.innerHTML = '<div class="empty-placeholder" id="devices-empty" style="grid-column: 1 / -1;">🔴 No active client devices streaming location. Start the Android game client to see live X, Y, Angle & Stream FPS.</div>';
+                return;
+            }
+
+            var activeIds = {};
+            devices.forEach(function(dev) {
+                activeIds[dev.id] = true;
+                updateSingleDeviceCard(dev);
+            });
+
+            // Clean up disconnected devices
+            var existingCards = container.getElementsByClassName('device-card');
+            for (var i = existingCards.length - 1; i >= 0; i--) {
+                var c = existingCards[i];
+                var cId = c.id.replace('dev-card-', '');
+                if (!activeIds[cId]) {
+                    c.remove();
+                }
+            }
         }
 
         function clearAllTerminals() {

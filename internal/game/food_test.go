@@ -203,3 +203,90 @@ func TestDirectLocationStreamTriggersEat(t *testing.T) {
 	}
 }
 
+func TestSpatialFoodGrid_IndexQueryAndRemove(t *testing.T) {
+	grid := NewSpatialFoodGrid()
+
+	// 1. Create sample foods scattered across the 30k x 30k arena
+	foods := []*FoodItem{
+		{ID: 1, X: 250, Y: 250, Value: 5, Radius: 10, ColorIndex: 1},     // Cell: (0, 0) -> idx: 0
+		{ID: 2, X: 750, Y: 250, Value: 3, Radius: 8, ColorIndex: 2},      // Cell: (1, 0) -> idx: 1
+		{ID: 3, X: 250, Y: 750, Value: 4, Radius: 9, ColorIndex: 3},      // Cell: (0, 1) -> idx: 60
+		{ID: 4, X: 15000, Y: 15000, Value: 10, Radius: 12, ColorIndex: 4}, // Cell: (30, 30) -> idx: 1830
+		{ID: 5, X: 29900, Y: 29900, Value: 2, Radius: 7, ColorIndex: 5},   // Cell: (59, 59) -> idx: 3599
+	}
+
+	// 2. Test IndexFoods
+	grid.IndexFoods(foods)
+
+	if grid.Count() != 5 {
+		t.Fatalf("Expected 5 foods indexed, got %d", grid.Count())
+	}
+
+	// Verify cell index mapping formula: (floor(y/500)*60) + floor(x/500)
+	if idx := GetCellIndex(250, 250); idx != 0 {
+		t.Errorf("Expected cell 0 for (250, 250), got %d", idx)
+	}
+	if idx := GetCellIndex(750, 250); idx != 1 {
+		t.Errorf("Expected cell 1 for (750, 250), got %d", idx)
+	}
+	if idx := GetCellIndex(250, 750); idx != 60 {
+		t.Errorf("Expected cell 60 for (250, 750), got %d", idx)
+	}
+	if idx := GetCellIndex(15000, 15000); idx != 1830 {
+		t.Errorf("Expected cell 1830 for (15000, 15000), got %d", idx)
+	}
+	if idx := GetCellIndex(29900, 29900); idx != 3599 {
+		t.Errorf("Expected cell 3599 for (29900, 29900), got %d", idx)
+	}
+
+	// 3. Test QueryArea (Viewport AoI: [0, 0] to [1000, 1000])
+	// Should retrieve Food #1, #2, #3, but NOT Food #4 or #5
+	viewportFoods := grid.QueryArea(0, 0, 1000, 1000)
+	if len(viewportFoods) != 3 {
+		t.Fatalf("Expected 3 foods in viewport [0, 0, 1000, 1000], got %d", len(viewportFoods))
+	}
+
+	foundIDs := make(map[uint32]bool)
+	for _, f := range viewportFoods {
+		foundIDs[f.ID] = true
+	}
+	if !foundIDs[1] || !foundIDs[2] || !foundIDs[3] {
+		t.Errorf("Expected Food IDs 1, 2, 3 in viewport, got %+v", foundIDs)
+	}
+	if foundIDs[4] || foundIDs[5] {
+		t.Errorf("Did not expect distant foods in viewport query")
+	}
+
+	// Query middle arena: [14000, 14000] to [16000, 16000]
+	midFoods := grid.QueryArea(14000, 14000, 16000, 16000)
+	if len(midFoods) != 1 || midFoods[0].ID != 4 {
+		t.Errorf("Expected only Food #4 in mid query, got %d items", len(midFoods))
+	}
+
+	// 4. Test RemoveFood (O(1) instant removal upon eating)
+	removed := grid.RemoveFood(2)
+	if removed == nil || removed.ID != 2 {
+		t.Fatalf("Expected Food #2 to be removed and returned")
+	}
+
+	if grid.Count() != 4 {
+		t.Errorf("Expected count 4 after removal, got %d", grid.Count())
+	}
+
+	if grid.GetFood(2) != nil {
+		t.Errorf("Expected Food #2 to no longer exist in grid")
+	}
+
+	// Re-query viewport: Food #2 should no longer be present
+	viewportAfterRemove := grid.QueryArea(0, 0, 1000, 1000)
+	if len(viewportAfterRemove) != 2 {
+		t.Fatalf("Expected 2 foods in viewport after removal, got %d", len(viewportAfterRemove))
+	}
+
+	// Remove non-existent food
+	if grid.RemoveFood(99999) != nil {
+		t.Errorf("Expected nil when removing non-existent food")
+	}
+}
+
+
