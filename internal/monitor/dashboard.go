@@ -403,6 +403,7 @@ const DashboardHTML = `<!DOCTYPE html>
         </div>
 
         <div style="display: flex; gap: 6px;">
+            <button class="btn" style="background: linear-gradient(135deg, #9333ea, #c026d3); border-color: #e879f9; color: #fff; font-weight: 700;" onclick="toggleVisualizer()">🗺️ Visualizer & Bot Eater</button>
             <button class="btn" style="background:#0284c7; border-color:#38bdf8; color:#fff;" onclick="spawnFoodBurst()">+50 Foods</button>
             <button class="btn" onclick="clearAllTerminals()">Clear</button>
         </div>
@@ -814,7 +815,483 @@ const DashboardHTML = `<!DOCTYPE html>
                 })
                 .catch(function(err) { console.error(err); });
         }
+
+        /* ==========================================================================
+           🗺️ INTERACTIVE ARENA VISUALIZER & BOT EATER CONTROLLER
+           ========================================================================== */
+        var vizActive = false;
+        var vizCanvas, vizCtx;
+        var vizScale = 1.0;
+        var vizRadius = 1500;
+        var vizMouseWorld = { x: 15000, y: 15000, isOver: false, isDown: false };
+        var vizPlayers = [];
+        var vizRipples = [];
+        var vizBotTotalEaten = 0;
+        var vizBotTotalScore = 0;
+        var vizPollTimer = null;
+        var vizAutoPatrol = false;
+        var vizPatrolAngle = 0;
+        var vizPatrolPos = { x: 15000, y: 15000 };
+
+        function toggleVisualizer() {
+            var modal = document.getElementById('viz-modal');
+            if (!modal) return;
+            vizActive = !vizActive;
+            if (vizActive) {
+                modal.style.display = 'flex';
+                initVisualizerCanvas();
+                startVisualizerLoop();
+            } else {
+                modal.style.display = 'none';
+                stopVisualizerLoop();
+            }
+        }
+
+        function initVisualizerCanvas() {
+            vizCanvas = document.getElementById('viz-canvas');
+            if (!vizCanvas) return;
+            vizCtx = vizCanvas.getContext('2d');
+
+            // Handle resize
+            var size = Math.min(vizCanvas.parentElement.clientWidth - 20, vizCanvas.parentElement.clientHeight - 20, 680);
+            if (size < 320) size = 320;
+            vizCanvas.width = size;
+            vizCanvas.height = size;
+            vizScale = size / 30000.0;
+
+            vizCanvas.onmousemove = function(e) {
+                var rect = vizCanvas.getBoundingClientRect();
+                var cx = e.clientX - rect.left;
+                var cy = e.clientY - rect.top;
+                vizMouseWorld.x = Math.max(0, Math.min(30000, cx / vizScale));
+                vizMouseWorld.y = Math.max(0, Math.min(30000, cy / vizScale));
+                vizMouseWorld.isOver = true;
+
+                var coordEl = document.getElementById('viz-mouse-coord');
+                if (coordEl) coordEl.textContent = 'X: ' + Math.round(vizMouseWorld.x) + ', Y: ' + Math.round(vizMouseWorld.y);
+
+                if (vizMouseWorld.isDown && document.getElementById('viz-mode-drag').checked) {
+                    triggerBotEat(vizMouseWorld.x, vizMouseWorld.y, vizRadius);
+                }
+            };
+
+            vizCanvas.onmouseleave = function() {
+                vizMouseWorld.isOver = false;
+                vizMouseWorld.isDown = false;
+            };
+
+            vizCanvas.onmousedown = function(e) {
+                if (e.button !== 0) return;
+                vizMouseWorld.isDown = true;
+                triggerBotEat(vizMouseWorld.x, vizMouseWorld.y, vizRadius);
+            };
+
+            vizCanvas.onmouseup = function() {
+                vizMouseWorld.isDown = false;
+            };
+
+            // Radius Slider
+            var slider = document.getElementById('viz-radius-slider');
+            if (slider) {
+                slider.oninput = function() {
+                    vizRadius = parseFloat(this.value);
+                    document.getElementById('viz-radius-val').textContent = vizRadius + ' units';
+                };
+            }
+        }
+
+        function triggerBotEat(wx, wy, radius) {
+            var botName = document.getElementById('viz-bot-name') ? document.getElementById('viz-bot-name').value : 'bot_tester';
+            if (!botName) botName = 'bot_tester';
+
+            // Add visual ripple
+            vizRipples.push({
+                x: wx,
+                y: wy,
+                radius: 10,
+                maxRadius: radius,
+                alpha: 1.0,
+                text: 'Eating...'
+            });
+
+            var url = '/api/monitor/action?action=bot_eat_area&x=' + wx.toFixed(1) + '&y=' + wy.toFixed(1) + '&radius=' + radius.toFixed(1) + '&bot_id=' + encodeURIComponent(botName);
+
+            fetch(url, { method: 'POST' })
+                .then(function(r) { return r.json(); })
+                .then(function(data) {
+                    if (data && data.status === 'ok') {
+                        vizBotTotalEaten += (data.foods_eaten || 0);
+                        vizBotTotalScore += (data.score_gained || 0);
+
+                        var eatenEl = document.getElementById('viz-bot-eaten');
+                        var scoreEl = document.getElementById('viz-bot-score');
+                        var lastEl = document.getElementById('viz-last-action');
+
+                        if (eatenEl) eatenEl.textContent = vizBotTotalEaten;
+                        if (scoreEl) scoreEl.textContent = vizBotTotalScore;
+                        if (lastEl) {
+                            lastEl.textContent = (data.foods_eaten > 0) 
+                                ? ('🍎 Consumed ' + data.foods_eaten + ' food(s) (+' + data.score_gained + ' pts)') 
+                                : 'No foods in this circle';
+                            lastEl.style.color = (data.foods_eaten > 0) ? '#22c55e' : '#94a3b8';
+                        }
+                    }
+                })
+                .catch(function(err) {
+                    console.error('Bot eat request error:', err);
+                });
+        }
+
+        function startVisualizerLoop() {
+            fetchLivePlayers();
+            if (vizPollTimer) clearInterval(vizPollTimer);
+            vizPollTimer = setInterval(fetchLivePlayers, 300);
+            requestAnimationFrame(renderVisualizerFrame);
+        }
+
+        function stopVisualizerLoop() {
+            if (vizPollTimer) {
+                clearInterval(vizPollTimer);
+                vizPollTimer = null;
+            }
+        }
+
+        function fetchLivePlayers() {
+            if (!vizActive) return;
+            fetch('/api/players/live')
+                .then(function(r) { return r.json(); })
+                .then(function(data) {
+                    if (data && data.players) {
+                        vizPlayers = data.players;
+                        updateVizPlayerList(vizPlayers);
+                    }
+                })
+                .catch(function(err) { /* silent */ });
+        }
+
+        function updateVizPlayerList(players) {
+            var listEl = document.getElementById('viz-player-list');
+            if (!listEl) return;
+            if (!players || players.length === 0) {
+                listEl.innerHTML = '<div style="color: #64748b; font-size: 11px; padding: 6px;">No live players in arena</div>';
+                return;
+            }
+            var html = '';
+            players.forEach(function(p) {
+                html += '<div style="display:flex; justify-content:space-between; align-items:center; background:rgba(15,23,42,0.8); border:1px solid #1e293b; border-radius:5px; padding:5px 8px; margin-bottom:4px; font-size:11px;">' +
+                    '<div><span style="color:#22c55e; font-weight:700;">🟢 ' + escapeHtml(p.name || p.id) + '</span></div>' +
+                    '<div style="color:#94a3b8; font-family:\'Fira Code\',monospace;">(' + Math.round(p.x) + ', ' + Math.round(p.y) + ') | <span style="color:#f59e0b; font-weight:700;">' + p.score + '</span></div>' +
+                '</div>';
+            });
+            listEl.innerHTML = html;
+        }
+
+        function renderVisualizerFrame() {
+            if (!vizActive || !vizCanvas || !vizCtx) return;
+
+            var w = vizCanvas.width;
+            var h = vizCanvas.height;
+
+            // 1. Clear background
+            vizCtx.fillStyle = '#050811';
+            vizCtx.fillRect(0, 0, w, h);
+
+            // 2. Draw Spatial Grid (every 3000 world units)
+            vizCtx.strokeStyle = 'rgba(30, 41, 59, 0.45)';
+            vizCtx.lineWidth = 1;
+            for (var gx = 0; gx <= 30000; gx += 3000) {
+                var cx = gx * vizScale;
+                vizCtx.beginPath();
+                vizCtx.moveTo(cx, 0);
+                vizCtx.lineTo(cx, h);
+                vizCtx.stroke();
+            }
+            for (var gy = 0; gy <= 30000; gy += 3000) {
+                var cy = gy * vizScale;
+                vizCtx.beginPath();
+                vizCtx.moveTo(0, cy);
+                vizCtx.lineTo(w, cy);
+                vizCtx.stroke();
+            }
+
+            // 3. Draw Playable Arena Border (220 to 29780)
+            var bMargin = 220 * vizScale;
+            var bW = (30000 - 440) * vizScale;
+            vizCtx.strokeStyle = 'rgba(244, 63, 94, 0.75)';
+            vizCtx.lineWidth = 2;
+            vizCtx.setLineDash([6, 4]);
+            vizCtx.strokeRect(bMargin, bMargin, bW, bW);
+            vizCtx.setLineDash([]);
+
+            // Label Border
+            vizCtx.fillStyle = '#f43f5e';
+            vizCtx.font = '9px Fira Code, monospace';
+            vizCtx.fillText('BORDER (220, 220)', bMargin + 4, bMargin + 12);
+            vizCtx.fillText('30,000 x 30,000 ARENA', w - 140, h - 8);
+
+            // 4. Draw Active Players / Snakes
+            vizPlayers.forEach(function(p) {
+                var px = p.x * vizScale;
+                var py = p.y * vizScale;
+
+                // Player AoI Preview Box (optional subtle ring)
+                vizCtx.strokeStyle = 'rgba(56, 189, 248, 0.2)';
+                vizCtx.lineWidth = 1;
+                vizCtx.beginPath();
+                vizCtx.arc(px, py, 2400 * vizScale, 0, Math.PI * 2);
+                vizCtx.stroke();
+
+                // Player Head Dot (Neon Green Glow)
+                vizCtx.shadowColor = '#22c55e';
+                vizCtx.shadowBlur = 10;
+                vizCtx.fillStyle = '#22c55e';
+                vizCtx.beginPath();
+                vizCtx.arc(px, py, 5, 0, Math.PI * 2);
+                vizCtx.fill();
+
+                // Direction Vector Arrow
+                var angle = p.angle || 0;
+                var arrowLen = 14;
+                vizCtx.strokeStyle = '#fff';
+                vizCtx.lineWidth = 2;
+                vizCtx.beginPath();
+                vizCtx.moveTo(px, py);
+                vizCtx.lineTo(px + Math.cos(angle) * arrowLen, py + Math.sin(angle) * arrowLen);
+                vizCtx.stroke();
+                vizCtx.shadowBlur = 0;
+
+                // Player Name Tag & Score
+                vizCtx.fillStyle = '#fff';
+                vizCtx.font = 'bold 10px Inter, sans-serif';
+                vizCtx.fillText(p.name || p.id, px + 8, py - 4);
+                vizCtx.fillStyle = '#f59e0b';
+                vizCtx.font = '9px Fira Code, monospace';
+                vizCtx.fillText('Score: ' + p.score, px + 8, py + 8);
+            });
+
+            // 5. Draw Auto-Patrol Bot if active
+            if (vizAutoPatrol) {
+                vizPatrolAngle += 0.03;
+                vizPatrolPos.x = 15000 + Math.cos(vizPatrolAngle) * 8000;
+                vizPatrolPos.y = 15000 + Math.sin(vizPatrolAngle * 1.3) * 8000;
+                triggerBotEat(vizPatrolPos.x, vizPatrolPos.y, vizRadius);
+
+                var bx = vizPatrolPos.x * vizScale;
+                var by = vizPatrolPos.y * vizScale;
+                vizCtx.strokeStyle = '#a855f7';
+                vizCtx.lineWidth = 2;
+                vizCtx.beginPath();
+                vizCtx.arc(bx, by, vizRadius * vizScale, 0, Math.PI * 2);
+                vizCtx.stroke();
+            }
+
+            // 6. Draw Shockwave Ripples
+            for (var i = vizRipples.length - 1; i >= 0; i--) {
+                var rip = vizRipples[i];
+                rip.radius += (rip.maxRadius - rip.radius) * 0.18 + 2;
+                rip.alpha -= 0.035;
+
+                if (rip.alpha <= 0) {
+                    vizRipples.splice(i, 1);
+                    continue;
+                }
+
+                var rx = rip.x * vizScale;
+                var ry = rip.y * vizScale;
+                var rRad = rip.radius * vizScale;
+
+                vizCtx.strokeStyle = 'rgba(232, 121, 249, ' + rip.alpha + ')';
+                vizCtx.lineWidth = 2.5;
+                vizCtx.beginPath();
+                vizCtx.arc(rx, ry, rRad, 0, Math.PI * 2);
+                vizCtx.stroke();
+
+                vizCtx.fillStyle = 'rgba(244, 114, 182, ' + (rip.alpha * 0.15) + ')';
+                vizCtx.fill();
+            }
+
+            // 7. Draw Interactive Bot Eater Circle at Mouse
+            if (vizMouseWorld.isOver) {
+                var mx = vizMouseWorld.x * vizScale;
+                var my = vizMouseWorld.y * vizScale;
+                var mRad = vizRadius * vizScale;
+
+                vizCtx.shadowColor = '#d946ef';
+                vizCtx.shadowBlur = 12;
+                vizCtx.strokeStyle = '#e879f9';
+                vizCtx.lineWidth = 2;
+                vizCtx.beginPath();
+                vizCtx.arc(mx, my, mRad, 0, Math.PI * 2);
+                vizCtx.stroke();
+
+                vizCtx.fillStyle = 'rgba(217, 70, 239, 0.12)';
+                vizCtx.fill();
+                vizCtx.shadowBlur = 0;
+
+                // Center crosshair
+                vizCtx.strokeStyle = '#f472b6';
+                vizCtx.lineWidth = 1;
+                vizCtx.beginPath();
+                vizCtx.moveTo(mx - 6, my);
+                vizCtx.lineTo(mx + 6, my);
+                vizCtx.moveTo(mx, my - 6);
+                vizCtx.lineTo(mx, my + 6);
+                vizCtx.stroke();
+
+                // Circle Info Tag
+                vizCtx.fillStyle = '#e879f9';
+                vizCtx.font = 'bold 9.5px Fira Code, monospace';
+                vizCtx.fillText('BOT EATER (R: ' + vizRadius + ')', mx + mRad + 6, my);
+            }
+
+            requestAnimationFrame(renderVisualizerFrame);
+        }
+
+        function toggleAutoPatrol() {
+            vizAutoPatrol = !vizAutoPatrol;
+            var btn = document.getElementById('btn-auto-patrol');
+            if (btn) {
+                btn.textContent = vizAutoPatrol ? '🛑 Stop Auto-Patrol' : '🚀 Start Auto-Patrol';
+                btn.style.background = vizAutoPatrol ? '#e11d48' : '#7c3aed';
+            }
+        }
+
+        function resetBotStats() {
+            vizBotTotalEaten = 0;
+            vizBotTotalScore = 0;
+            var eatenEl = document.getElementById('viz-bot-eaten');
+            var scoreEl = document.getElementById('viz-bot-score');
+            var lastEl = document.getElementById('viz-last-action');
+            if (eatenEl) eatenEl.textContent = '0';
+            if (scoreEl) scoreEl.textContent = '0';
+            if (lastEl) lastEl.textContent = 'Reset';
+        }
+
+        function eatCenter() {
+            triggerBotEat(15000, 15000, vizRadius);
+        }
+
+        function eatNearPlayer() {
+            if (vizPlayers && vizPlayers.length > 0) {
+                var p = vizPlayers[0];
+                triggerBotEat(p.x, p.y, vizRadius);
+            } else {
+                alert('No active player in arena to target.');
+            }
+        }
     </script>
+
+    <!-- 🗺️ ARENA VISUALIZER & INTERACTIVE BOT EATER MODAL -->
+    <div id="viz-modal" style="display:none; position:fixed; top:0; left:0; width:100vw; height:100vh; background:rgba(5, 8, 17, 0.92); backdrop-filter:blur(12px); z-index:99999; flex-direction:column; padding:16px; box-sizing:border-box;">
+        <!-- Modal Top Bar -->
+        <div style="display:flex; justify-content:space-between; align-items:center; border-bottom:1px solid var(--border-dim); padding-bottom:10px; margin-bottom:12px;">
+            <div style="display:flex; align-items:center; gap:12px;">
+                <span style="font-size:18px;">🗺️</span>
+                <div>
+                    <h2 style="font-size:15px; font-weight:700; color:#fff; letter-spacing:-0.3px;">Arena Visualizer & Interactive Bot Eater (30k × 30k Canvas)</h2>
+                    <p style="font-size:11px; color:#94a3b8;">Click or drag the circle to simulate an authoritative Eater Bot consuming all foods in that radius.</p>
+                </div>
+            </div>
+            <div style="display:flex; align-items:center; gap:8px;">
+                <button class="btn" style="background:#0284c7; border-color:#38bdf8; color:#fff;" onclick="spawnFoodBurst()">+50 Foods</button>
+                <button class="btn btn-disconnect" onclick="toggleVisualizer()">✕ Close Visualizer</button>
+            </div>
+        </div>
+
+        <!-- Modal Body: Canvas on Left, Controls on Right -->
+        <div style="display:flex; gap:16px; flex:1; min-height:0; overflow:hidden;">
+            <!-- Canvas Container -->
+            <div style="flex:1; display:flex; justify-content:center; align-items:center; background:#070b16; border:1px solid var(--border-dim); border-radius:8px; padding:10px; position:relative; overflow:hidden;">
+                <canvas id="viz-canvas" style="background:#050811; border:1px solid #1e293b; border-radius:6px; cursor:crosshair; box-shadow:0 0 25px rgba(0,0,0,0.8);"></canvas>
+                <!-- Live Mouse Coordinate Overlay -->
+                <div style="position:absolute; bottom:16px; left:16px; background:rgba(15,23,42,0.85); border:1px solid #334155; padding:4px 10px; border-radius:5px; font-family:'Fira Code',monospace; font-size:11px; color:#38bdf8;">
+                    📍 Canvas World: <span id="viz-mouse-coord" style="font-weight:700; color:#fff;">X: 15000, Y: 15000</span>
+                </div>
+            </div>
+
+            <!-- Controls & Live Stats Sidebar -->
+            <div style="width:340px; display:flex; flex-direction:column; gap:12px; overflow-y:auto;">
+                <!-- Card 1: Bot Settings -->
+                <div style="background:#0d1322; border:1px solid var(--border-dim); border-radius:8px; padding:12px;">
+                    <div style="font-size:12px; font-weight:700; color:#e879f9; margin-bottom:10px; display:flex; justify-content:space-between; align-items:center;">
+                        <span>🤖 BOT EATER CONFIGURATION</span>
+                        <span style="font-size:10px; color:#94a3b8;">Test Tool</span>
+                    </div>
+
+                    <!-- Radius Slider -->
+                    <div style="margin-bottom:12px;">
+                        <div style="display:flex; justify-content:space-between; font-size:11px; margin-bottom:4px;">
+                            <span style="color:#94a3b8;">Circle Radius:</span>
+                            <span style="color:#e879f9; font-weight:700; font-family:'Fira Code',monospace;" id="viz-radius-val">1500 units</span>
+                        </div>
+                        <input type="range" id="viz-radius-slider" min="300" max="5000" step="100" value="1500" style="width:100%; cursor:pointer;">
+                        <div style="display:flex; justify-content:space-between; font-size:9px; color:#64748b; margin-top:2px;">
+                            <span>300 (1 Grid)</span>
+                            <span>2400 (AoI Viewport)</span>
+                            <span>5000 (Mega)</span>
+                        </div>
+                    </div>
+
+                    <!-- Bot Name Input -->
+                    <div style="margin-bottom:12px;">
+                        <label style="font-size:11px; color:#94a3b8; display:block; margin-bottom:4px;">Bot ID / Name:</label>
+                        <input type="text" id="viz-bot-name" class="auth-input" value="bot_tester" style="width:100%;">
+                    </div>
+
+                    <!-- Mode Select -->
+                    <div style="margin-bottom:10px; font-size:11px;">
+                        <span style="color:#94a3b8; display:block; margin-bottom:6px;">Interaction Mode:</span>
+                        <div style="display:flex; gap:12px;">
+                            <label style="display:flex; align-items:center; gap:4px; color:#fff; cursor:pointer;">
+                                <input type="radio" name="viz-mode" id="viz-mode-click" checked> Single Click
+                            </label>
+                            <label style="display:flex; align-items:center; gap:4px; color:#fff; cursor:pointer;">
+                                <input type="radio" name="viz-mode" id="viz-mode-drag"> Drag Stream
+                            </label>
+                        </div>
+                    </div>
+
+                    <!-- Auto Patrol Button -->
+                    <button class="btn" id="btn-auto-patrol" style="width:100%; justify-content:center; background:#7c3aed; border-color:#a855f7; color:#fff;" onclick="toggleAutoPatrol()">🚀 Start Auto-Patrol Bot</button>
+                </div>
+
+                <!-- Card 2: Live Stats -->
+                <div style="background:#0d1322; border:1px solid var(--border-dim); border-radius:8px; padding:12px;">
+                    <div style="font-size:12px; font-weight:700; color:#38bdf8; margin-bottom:10px;">📊 BOT EATING METRICS</div>
+                    <div style="display:grid; grid-template-columns:1fr 1fr; gap:8px; margin-bottom:10px;">
+                        <div style="background:#090e1a; border:1px solid #1e293b; padding:8px; border-radius:6px; text-align:center;">
+                            <div style="font-size:10px; color:#94a3b8;">FOODS EATEN</div>
+                            <div style="font-size:18px; font-weight:700; color:#22c55e; font-family:'Fira Code',monospace;" id="viz-bot-eaten">0</div>
+                        </div>
+                        <div style="background:#090e1a; border:1px solid #1e293b; padding:8px; border-radius:6px; text-align:center;">
+                            <div style="font-size:10px; color:#94a3b8;">SCORE GAINED</div>
+                            <div style="font-size:18px; font-weight:700; color:#f59e0b; font-family:'Fira Code',monospace;" id="viz-bot-score">0</div>
+                        </div>
+                    </div>
+                    <div style="font-size:11px; color:#94a3b8; background:#090e1a; padding:6px 8px; border-radius:5px; border:1px solid #1e293b;">
+                        Last: <span id="viz-last-action" style="color:#fff; font-weight:600;">Ready to Eat</span>
+                    </div>
+                </div>
+
+                <!-- Card 3: Connected Live Players -->
+                <div style="background:#0d1322; border:1px solid var(--border-dim); border-radius:8px; padding:12px; flex:1; display:flex; flex-direction:column; min-height:120px;">
+                    <div style="font-size:12px; font-weight:700; color:#22c55e; margin-bottom:8px;">🎮 LIVE CLIENTS IN ARENA</div>
+                    <div id="viz-player-list" style="flex:1; overflow-y:auto; max-height:140px;">
+                        <div style="color:#64748b; font-size:11px;">Loading players...</div>
+                    </div>
+                </div>
+
+                <!-- Quick Action Buttons -->
+                <div style="display:flex; flex-direction:column; gap:6px;">
+                    <div style="display:flex; gap:6px;">
+                        <button class="btn" style="flex:1; justify-content:center;" onclick="eatNearPlayer()">🎯 Eat Around Player</button>
+                        <button class="btn" style="flex:1; justify-content:center;" onclick="eatCenter()">🎯 Eat Center</button>
+                    </div>
+                    <button class="btn" style="justify-content:center;" onclick="resetBotStats()">🔄 Reset Bot Stats</button>
+                </div>
+            </div>
+        </div>
+    </div>
 </body>
 </html>`
 

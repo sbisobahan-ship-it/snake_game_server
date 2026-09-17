@@ -1,4 +1,4 @@
-﻿package game
+package game
 
 import (
 	"bufio"
@@ -350,4 +350,14 @@ func (r *StaticFoodRegistry) GetFoodsInViewport(minX, minY, maxX, maxY float64) 
 	return result
 }
 
-
+// GetFoodPos returns the (X, Y) coordinates of a static food by ID (lock-free immutable lookup)
+func (r *StaticFoodRegistry) GetFoodPos(id uint32) (float32, float32, bool) {
+	if r == nil || r.foodByID == nil {
+		return 0, 0, false
+	}
+	food, exists := r.foodByID[id]
+	if !exists || food == nil {
+		return 0, 0, false
+	}
+	return food.X, food.Y, true
+}

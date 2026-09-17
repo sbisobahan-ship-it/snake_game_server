@@ -812,8 +812,14 @@ func (r *Room) GetAllFoodsDTO() []FoodDTO {
 
 // Tick executes a single game simulation frame (at 30 FPS / TPS)
 func (r *Room) Tick(dt float64) {
+	var deadEvents []DeadEvent
+	var tickEatenEvents []FoodEatenEvent
+	var state *WorldState
+	var broadcastFn func(state *WorldState)
+	var deadFn func(playerID string, ds *DeadSession)
+	var eatFn func(events []FoodEatenEvent)
+
 	r.mu.Lock()
-	defer r.mu.Unlock()
 
 	// 1. Update all living snakes position (dead reckoning simulation)
 	for _, p := range r.Players {
@@ -823,7 +829,6 @@ func (r *Room) Tick(dt float64) {
 	}
 
 	// 2. Fatal collision detection for all living snakes (boundary & snake body/head collisions)
-	var deadEvents []DeadEvent
 	for _, p := range r.Players {
 		if p.Snake != nil && p.Snake.IsAlive {
 			if ds, wasKilled := r.checkFatalCollisionsForPlayerLocked(p); wasKilled && ds != nil {
@@ -841,7 +846,6 @@ func (r *Room) Tick(dt float64) {
 	}
 
 	// 4. Spatial Collision Detection for all living snakes
-	var tickEatenEvents []FoodEatenEvent
 	for _, p := range r.Players {
 		if p.Snake != nil && p.Snake.IsAlive {
 			eaten := r.checkCollisionsForPlayerLocked(p)
@@ -851,29 +855,38 @@ func (r *Room) Tick(dt float64) {
 		}
 	}
 
-	// 5. Assemble and Broadcast Unified Snapshot Block (Players + Eaten Batch + Spawned Batch)
+	// 5. Assemble snapshot block under lock
 	if r.broadcastFn != nil {
-		state := r.getWorldStateLocked()
-		r.broadcastFn(state)
+		state = r.getWorldStateLocked()
+		broadcastFn = r.broadcastFn
 	}
 
-	// Clear frame batches after broadcasting
+	// Clear frame batches after snapshot extraction
 	r.pendingEaten = nil
 	r.pendingSpawned = nil
 
 	// 6. Instant O(1) FIFO Automatic Expiration for dynamic foods
 	r.evictExpiredFoodsLocked(time.Now().UnixMilli())
 
-	// 7. Fire instant authoritative death callbacks to clients
-	if len(deadEvents) > 0 && r.onPlayerDeadFn != nil {
+	deadFn = r.onPlayerDeadFn
+	eatFn = r.onEatBatchFn
+
+	// UNLOCK MUTEX before triggering external network callbacks to prevent nested deadlocks!
+	r.mu.Unlock()
+
+	// 7. Dispatch network callbacks outside lock
+	if broadcastFn != nil && state != nil {
+		broadcastFn(state)
+	}
+
+	if len(deadEvents) > 0 && deadFn != nil {
 		for _, de := range deadEvents {
-			r.onPlayerDeadFn(de.PlayerID, de.Session)
+			deadFn(de.PlayerID, de.Session)
 		}
 	}
 
-	// 8. Immediate real-time broadcast of eaten foods to all clients
-	if len(tickEatenEvents) > 0 && r.onEatBatchFn != nil {
-		r.onEatBatchFn(tickEatenEvents)
+	if len(tickEatenEvents) > 0 && eatFn != nil {
+		eatFn(tickEatenEvents)
 	}
 }
 
@@ -933,6 +946,183 @@ func (r *Room) getWorldStateLocked() *WorldState {
 		EatenFoods:   r.pendingEaten,
 		SpawnedFoods: r.pendingSpawned,
 	}
+}
+
+// GetFoodPosition returns (X, Y) coordinates of any static or dynamic food
+func (r *Room) GetFoodPosition(id uint32) (float32, float32, bool) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.getFoodPositionLocked(id)
+}
+
+func (r *Room) getFoodPositionLocked(id uint32) (float32, float32, bool) {
+	// 1. Check static foods registry
+	if r.StaticFoods != nil {
+		if x, y, ok := r.StaticFoods.GetFoodPos(id); ok {
+			return x, y, true
+		}
+	}
+	// 2. Check dynamic foods
+	if f, exists := r.Foods[id]; exists && f != nil {
+		return float32(f.Pos.X), float32(f.Pos.Y), true
+	}
+	return 0, 0, false
+}
+
+// GetWorldStateForPlayer generates an Area of Interest (AoI) filtered snapshot for a specific player
+func (r *Room) GetWorldStateForPlayer(playerID string, aoiRadius float64) *WorldState {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	p, exists := r.Players[playerID]
+	if !exists || p.Snake == nil || !p.Snake.IsAlive {
+		// Fallback for dead or spectating player: return full world state
+		return r.getWorldStateLocked()
+	}
+
+	if aoiRadius <= 0 {
+		if r.Config != nil && r.Config.AoIRadius > 0 {
+			aoiRadius = r.Config.AoIRadius
+		} else {
+			aoiRadius = 2400.0
+		}
+	}
+
+	px := p.Snake.Head.X
+	py := p.Snake.Head.Y
+	minX := px - aoiRadius
+	maxX := px + aoiRadius
+	minY := py - aoiRadius
+	maxY := py + aoiRadius
+
+	// 1. Filter Players / Snakes
+	playerDTOs := make([]PlayerDTO, 0, 8)
+	for _, other := range r.Players {
+		if other.Snake == nil {
+			continue
+		}
+
+		// Requesting player is always included
+		if other.ID == playerID {
+			playerDTOs = append(playerDTOs, PlayerDTO{
+				ID:               other.ID,
+				Name:             other.Name,
+				Head:             other.Snake.Head,
+				Angle:            other.Snake.Angle,
+				Body:             other.Snake.Body,
+				Score:            other.Snake.Score,
+				IsAlive:          other.Snake.IsAlive,
+				SkinID:           other.Snake.SkinID,
+				IsBoost:          other.Snake.IsBoosting,
+				StaticFoodsEaten: other.Snake.StaticFoodsEaten,
+				Segments:         len(other.Snake.Body),
+			})
+			continue
+		}
+
+		// Check if other snake's head is within AoI bounding box
+		otherHeadX := other.Snake.Head.X
+		otherHeadY := other.Snake.Head.Y
+		inAoI := (otherHeadX >= minX && otherHeadX <= maxX && otherHeadY >= minY && otherHeadY <= maxY)
+
+		// If head is outside, check if any body segments are within AoI
+		if !inAoI {
+			for _, seg := range other.Snake.Body {
+				if seg.X >= minX && seg.X <= maxX && seg.Y >= minY && seg.Y <= maxY {
+					inAoI = true
+					break
+				}
+			}
+		}
+
+		if inAoI {
+			playerDTOs = append(playerDTOs, PlayerDTO{
+				ID:               other.ID,
+				Name:             other.Name,
+				Head:             other.Snake.Head,
+				Angle:            other.Snake.Angle,
+				Body:             other.Snake.Body,
+				Score:            other.Snake.Score,
+				IsAlive:          other.Snake.IsAlive,
+				SkinID:           other.Snake.SkinID,
+				IsBoost:          other.Snake.IsBoosting,
+				StaticFoodsEaten: other.Snake.StaticFoodsEaten,
+				Segments:         len(other.Snake.Body),
+			})
+		}
+	}
+
+	// 2. Filter Spawned Foods (within AoI)
+	var filteredSpawned []FoodSpawnEvent
+	for _, sf := range r.pendingSpawned {
+		if float64(sf.X) >= minX && float64(sf.X) <= maxX && float64(sf.Y) >= minY && float64(sf.Y) <= maxY {
+			filteredSpawned = append(filteredSpawned, sf)
+		}
+	}
+
+	// 3. Filter Eaten Foods (eaten by this player OR within AoI)
+	var filteredEaten []FoodEatenEvent
+	for _, ef := range r.pendingEaten {
+		if ef.EaterID == playerID {
+			filteredEaten = append(filteredEaten, ef)
+			continue
+		}
+		fx, fy, ok := r.getFoodPositionLocked(ef.FoodID)
+		if ok && float64(fx) >= minX && float64(fx) <= maxX && float64(fy) >= minY && float64(fy) <= maxY {
+			filteredEaten = append(filteredEaten, ef)
+		}
+	}
+
+	return &WorldState{
+		Timestamp:    time.Now().UnixMilli(),
+		Players:      playerDTOs,
+		EatenFoods:   filteredEaten,
+		SpawnedFoods: filteredSpawned,
+	}
+}
+
+// FilterEatEventsForPlayer filters a batch of real-time eat events for a specific player's AoI
+func (r *Room) FilterEatEventsForPlayer(playerID string, events []FoodEatenEvent, aoiRadius float64) []FoodEatenEvent {
+	if len(events) == 0 {
+		return nil
+	}
+
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	p, exists := r.Players[playerID]
+	if !exists || p.Snake == nil || !p.Snake.IsAlive {
+		// Player not active or dead: no eat events needed
+		return nil
+	}
+
+	if aoiRadius <= 0 {
+		if r.Config != nil && r.Config.AoIRadius > 0 {
+			aoiRadius = r.Config.AoIRadius
+		} else {
+			aoiRadius = 2400.0
+		}
+	}
+
+	px := p.Snake.Head.X
+	py := p.Snake.Head.Y
+	minX := px - aoiRadius
+	maxX := px + aoiRadius
+	minY := py - aoiRadius
+	maxY := py + aoiRadius
+
+	var filtered []FoodEatenEvent
+	for _, ef := range events {
+		if ef.EaterID == playerID {
+			filtered = append(filtered, ef)
+			continue
+		}
+		fx, fy, ok := r.getFoodPositionLocked(ef.FoodID)
+		if ok && float64(fx) >= minX && float64(fx) <= maxX && float64(fy) >= minY && float64(fy) <= maxY {
+			filtered = append(filtered, ef)
+		}
+	}
+	return filtered
 }
 
 // GetPlayerCount returns active player count

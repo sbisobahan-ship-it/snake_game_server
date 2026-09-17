@@ -38,18 +38,39 @@ func NewManager(room *game.Room) *Manager {
 	}
 
 	// Register high-speed real-time eaten food broadcast callback:
-	// Broadcasts eaten food ID(s) to ALL connected clients in real-time
+	// Broadcasts eaten food ID(s) to connected clients filtered by Area of Interest (AoI)
 	room.SetEatBatchCallback(func(events []game.FoodEatenEvent) {
 		if len(events) == 0 {
 			return
 		}
-		// 1. Binary broadcast (Opcode 0x06)
-		binData := EncodeEatBatchBinary(events)
-		m.BroadcastBinary(binData)
 
-		// JSON broadcast omitted for pure binary high-speed stream
+		m.mu.RLock()
+		clients := make([]*Client, 0, len(m.clients))
+		for _, c := range m.clients {
+			clients = append(clients, c)
+		}
+		m.mu.RUnlock()
 
-		monitor.DefaultHub.Emit(monitor.ChanFood, "eat", "⚡ [REAL-TIME EAT BROADCAST] Broadcast %d eaten food(s) to %d connected players", len(events), m.GetActiveClientCount())
+		if len(clients) == 0 {
+			return
+		}
+
+		aoiRadius := 2400.0
+		if m.room != nil && m.room.Config != nil && m.room.Config.AoIRadius > 0 {
+			aoiRadius = m.room.Config.AoIRadius
+		}
+
+		sentCount := 0
+		for _, client := range clients {
+			filteredEvents := m.room.FilterEatEventsForPlayer(client.ID, events, aoiRadius)
+			if len(filteredEvents) > 0 {
+				binData := EncodeEatBatchBinary(filteredEvents)
+				client.SendBinary(binData)
+				sentCount++
+			}
+		}
+
+		monitor.DefaultHub.Emit(monitor.ChanFood, "eat", "⚡ [REAL-TIME EAT BROADCAST] Sent %d eaten food(s) to %d nearby player(s)", len(events), sentCount)
 	})
 
 	// Register authoritative player death notification callback:
@@ -612,19 +633,36 @@ func (m *Manager) handleDisconnect(client *Client) {
 	}
 }
 
-// BroadcastWorldState sends unified binary block frame to all clients at 30 FPS
-func (m *Manager) BroadcastWorldState(state *game.WorldState) {
-	if len(state.Players) == 0 {
+// BroadcastWorldState sends AoI-filtered binary block frames to each client at 30 FPS
+func (m *Manager) BroadcastWorldState(globalState *game.WorldState) {
+	m.mu.RLock()
+	clients := make([]*Client, 0, len(m.clients))
+	for _, c := range m.clients {
+		clients = append(clients, c)
+	}
+	m.mu.RUnlock()
+
+	if len(clients) == 0 {
 		return
 	}
 
-	binData := EncodeWorldStateBinary(state)
+	aoiRadius := 2400.0
+	if m.room != nil && m.room.Config != nil && m.room.Config.AoIRadius > 0 {
+		aoiRadius = m.room.Config.AoIRadius
+	}
 
-	m.mu.RLock()
-	defer m.mu.RUnlock()
+	for _, client := range clients {
+		var clientState *game.WorldState
+		if m.room != nil {
+			clientState = m.room.GetWorldStateForPlayer(client.ID, aoiRadius)
+		} else {
+			clientState = globalState
+		}
 
-	for _, client := range m.clients {
-		client.SendBinary(binData)
+		if clientState != nil && len(clientState.Players) > 0 {
+			binData := EncodeWorldStateBinary(clientState)
+			client.SendBinary(binData)
+		}
 	}
 }
 

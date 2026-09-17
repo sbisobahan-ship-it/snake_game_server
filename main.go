@@ -71,6 +71,7 @@ func main() {
 	// 4. Action Endpoint for Dashboard
 	mux.HandleFunc("/api/monitor/action", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Access-Control-Allow-Origin", "*")
 		action := r.URL.Query().Get("action")
 		if action == "spawn_foods" {
 			countStr := r.URL.Query().Get("count")
@@ -84,6 +85,21 @@ func main() {
 				"spawned":     count,
 				"total_foods": total,
 			})
+			return
+		}
+		if action == "bot_eat_area" {
+			x, _ := strconv.ParseFloat(r.URL.Query().Get("x"), 64)
+			y, _ := strconv.ParseFloat(r.URL.Query().Get("y"), 64)
+			radius, _ := strconv.ParseFloat(r.URL.Query().Get("radius"), 64)
+			botID := r.URL.Query().Get("bot_id")
+			if botID == "" {
+				botID = "bot_tester"
+			}
+			if radius <= 0 {
+				radius = 500.0
+			}
+			res := room.BotEatArea(x, y, radius, botID)
+			json.NewEncoder(w).Encode(res)
 			return
 		}
 		json.NewEncoder(w).Encode(map[string]string{"status": "unknown_action"})
@@ -110,6 +126,17 @@ func main() {
 			"timestamp":             time.Now().UnixMilli(),
 		}
 		json.NewEncoder(w).Encode(info)
+	})
+
+	// 6b. Live Players Positions Endpoint for Visualizer
+	mux.HandleFunc("/api/players/live", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		players := room.GetLivePlayersSummary()
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"count":   len(players),
+			"players": players,
+		})
 	})
 
 	// 7. Active Foods on Arena Endpoint
